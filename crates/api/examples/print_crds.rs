@@ -1,16 +1,8 @@
-use frontend_forge_api::{FrontendIntegration, JSBundle};
+use frontend_forge_api::FrontendIntegration;
 use kube::CustomResourceExt;
 
 fn main() {
     let fi = FrontendIntegration::crd();
-    let bundle = JSBundle::crd();
-
-    println!(
-        "{}---",
-        serde_yaml::to_string(&fi).expect("serialize FI CRD")
-    );
-    println!(
-        "{}",
-        serde_yaml::to_string(&bundle).expect("serialize JSBundle CRD")
-    );
+    // JSBundle is a third-party CRD (extensions.kubesphere.io) and is not generated here.
+    println!("{}", serde_yaml::to_string(&fi).expect("serialize FI CRD"));
 }

@@ -12,6 +12,7 @@ pub const LABEL_SPEC_HASH: &str = "frontend-forge.io/spec-hash";
 pub const LABEL_MANIFEST_HASH: &str = "frontend-forge.io/manifest-hash";
 pub const LABEL_BUILD_KIND: &str = "frontend-forge.io/build-kind";
 pub const ANNO_BUILD_JOB: &str = "frontend-forge.io/build-job";
+pub const ANNO_MANIFEST_HASH: &str = "frontend-forge.io/manifest-hash";
 pub const ANNO_OBSERVED_GENERATION: &str = "frontend-forge.io/observed-generation";
 pub const BUILD_KIND_VALUE: &str = "frontend-forge";
 pub const DEFAULT_MANIFEST_FILENAME: &str = "manifest.json";
@@ -85,6 +86,10 @@ pub fn hash_short(hash: &str) -> String {
 
 pub fn default_bundle_name(fi_name: &str) -> String {
     bounded_name(&format!("fi-{}", fi_name), 63)
+}
+
+pub fn default_cluster_bundle_name(fi_namespace: &str, fi_name: &str) -> String {
+    bounded_name(&format!("fi-{}-{}", fi_namespace, fi_name), 63)
 }
 
 pub fn job_name(fi_name: &str, manifest_hash: &str, nonce: &str) -> String {

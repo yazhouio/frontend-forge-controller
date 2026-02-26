@@ -7,25 +7,68 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: frontend-forge-runner
+  name: frontend-forge-runner-fi-reader
   namespace: default
 rules:
   - apiGroups: ["frontend-forge.io"]
     resources: ["frontendintegrations"]
     verbs: ["get"]
-  - apiGroups: ["frontend-forge.io"]
-    resources: ["jsbundles"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: frontend-forge-runner-fi-reader
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: frontend-forge-runner-fi-reader
+subjects:
+  - kind: ServiceAccount
+    name: frontend-forge-runner
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: frontend-forge-runner-config-writer
+  namespace: extension-frontend-forge
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
     verbs: ["get", "create", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: frontend-forge-runner
-  namespace: default
+  name: frontend-forge-runner-config-writer
+  namespace: extension-frontend-forge
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: frontend-forge-runner
+  name: frontend-forge-runner-config-writer
+subjects:
+  - kind: ServiceAccount
+    name: frontend-forge-runner
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: frontend-forge-runner-jsbundle-writer
+rules:
+  - apiGroups: ["extensions.kubesphere.io"]
+    resources: ["jsbundles"]
+    verbs: ["get", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: frontend-forge-runner-jsbundle-writer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: frontend-forge-runner-jsbundle-writer
 subjects:
   - kind: ServiceAccount
     name: frontend-forge-runner

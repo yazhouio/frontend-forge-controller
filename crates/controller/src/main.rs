@@ -4,9 +4,9 @@ use frontend_forge_api::{
     JSBundle, ResourceRef,
 };
 use frontend_forge_common::{
-    ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, LABEL_BUILD_KIND, LABEL_FI_NAME,
-    LABEL_MANAGED_BY, LABEL_SPEC_HASH, MANAGED_BY_VALUE, default_bundle_name, job_name,
-    serializable_hash, time_nonce,
+    ANNO_MANIFEST_HASH, ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, LABEL_BUILD_KIND,
+    LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE,
+    default_cluster_bundle_name, job_name, serializable_hash, time_nonce,
 };
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::JobStatus;
@@ -73,6 +73,8 @@ struct ControllerConfig {
     runner_image: String,
     runner_service_account: Option<String>,
     build_service_base_url: String,
+    jsbundle_configmap_namespace: String,
+    jsbundle_config_key: String,
     build_service_timeout_seconds: u64,
     stale_check_grace_seconds: u64,
     reconcile_requeue_seconds: u64,
@@ -87,6 +89,10 @@ impl ControllerConfig {
             runner_service_account: env::var("RUNNER_SERVICE_ACCOUNT").ok(),
             build_service_base_url: env::var("BUILD_SERVICE_BASE_URL")
                 .unwrap_or_else(|_| "http://build-service.default.svc.cluster.local".to_string()),
+            jsbundle_configmap_namespace: env::var("JSBUNDLE_CONFIGMAP_NAMESPACE")
+                .unwrap_or_else(|_| "extension-frontend-forge".to_string()),
+            jsbundle_config_key: env::var("JSBUNDLE_CONFIG_KEY")
+                .unwrap_or_else(|_| "index.js".to_string()),
             build_service_timeout_seconds: env::var("BUILD_SERVICE_TIMEOUT_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -137,11 +143,8 @@ async fn main() -> Result<(), Error> {
 
     let fi_api = Api::<FrontendIntegration>::all(client.clone());
     let job_api = Api::<Job>::all(client.clone());
-    let bundle_api = Api::<JSBundle>::all(client.clone());
-
     Controller::new(fi_api, watcher::Config::default())
         .owns(job_api, watcher::Config::default())
-        .owns(bundle_api, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
         .for_each(|result| async move {
             match result {
@@ -168,7 +171,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
 
     let fi_api = Api::<FrontendIntegration>::namespaced(client.clone(), &ns);
     let job_api = Api::<Job>::namespaced(client.clone(), &ns);
-    let bundle_api = Api::<JSBundle>::namespaced(client.clone(), &ns);
+    let bundle_api = Api::<JSBundle>::all(client.clone());
 
     if fi.meta().deletion_timestamp.is_some() {
         return Ok(Action::await_change());
@@ -201,7 +204,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
 
     let spec_hash = serializable_hash(&fi.spec).context(CommonSnafu)?;
 
-    let desired_bundle_name = default_bundle_name(&fi_name);
+    let desired_bundle_name = default_cluster_bundle_name(&ns, &fi_name);
 
     let needs_build = needs_new_build(&fi, &spec_hash);
     if needs_build {
@@ -292,42 +295,43 @@ async fn sync_status_from_children(
                 return Ok(Action::await_change());
             }
             ObservedJobPhase::Succeeded => {
-                let bundle = get_bundle_opt(bundle_api, namespace, bundle_name).await?;
+                let bundle = get_bundle_opt(bundle_api, bundle_name).await?;
                 if let Some(bundle) = bundle {
                     if bundle_matches_spec_hash(&bundle, spec_hash) {
                         let status = succeeded_status(fi, spec_hash, &bundle, &job);
                         patch_fi_status(fi_api, fi, status).await?;
                         return Ok(Action::await_change());
                     }
-                    let status = failed_status(
+                    let status = building_status(
                         fi,
                         spec_hash,
-                        format!(
-                            "Job succeeded but JSBundle {} specHash label mismatch (expected {})",
-                            bundle_name, spec_hash
-                        ),
+                        bundle_name,
+                        &job,
+                        "Job succeeded; waiting for JSBundle with matching spec-hash",
                     );
                     patch_fi_status(fi_api, fi, status).await?;
-                    return Ok(Action::await_change());
+                    return Ok(Action::requeue(Duration::from_secs(requeue_seconds)));
                 }
 
-                let status = failed_status(
+                let status = building_status(
                     fi,
                     spec_hash,
-                    format!("Job succeeded but JSBundle {} was not found", bundle_name),
+                    bundle_name,
+                    &job,
+                    "Job succeeded; waiting for JSBundle materialization",
                 );
                 patch_fi_status(fi_api, fi, status).await?;
-                return Ok(Action::await_change());
+                return Ok(Action::requeue(Duration::from_secs(requeue_seconds)));
             }
         }
     }
 
-    if let Some(bundle) = get_bundle_opt(bundle_api, namespace, bundle_name).await? {
+    if let Some(bundle) = get_bundle_opt(bundle_api, bundle_name).await? {
         if bundle_matches_spec_hash(&bundle, spec_hash) {
             let status = FrontendIntegrationStatus {
                 phase: Some(FrontendIntegrationPhase::Succeeded),
                 observed_spec_hash: Some(spec_hash.to_string()),
-                observed_manifest_hash: Some(bundle.spec.manifest_hash.clone()),
+                observed_manifest_hash: bundle_manifest_hash(&bundle),
                 observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
                 active_build: fi.status.as_ref().and_then(|s| s.active_build.clone()),
                 bundle_ref: Some(resource_ref(&bundle)),
@@ -486,6 +490,16 @@ fn make_build_job(
             ..Default::default()
         },
         EnvVar {
+            name: "JSBUNDLE_CONFIGMAP_NAMESPACE".to_string(),
+            value: Some(config.jsbundle_configmap_namespace.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "JSBUNDLE_CONFIG_KEY".to_string(),
+            value: Some(config.jsbundle_config_key.clone()),
+            ..Default::default()
+        },
+        EnvVar {
             name: "BUILD_SERVICE_TIMEOUT_SECONDS".to_string(),
             value: Some(config.build_service_timeout_seconds.to_string()),
             ..Default::default()
@@ -562,16 +576,12 @@ async fn create_or_get_job(
     }
 }
 
-async fn get_bundle_opt(
-    bundle_api: &Api<JSBundle>,
-    namespace: &str,
-    name: &str,
-) -> Result<Option<JSBundle>, Error> {
+async fn get_bundle_opt(bundle_api: &Api<JSBundle>, name: &str) -> Result<Option<JSBundle>, Error> {
     bundle_api
         .get_opt(name)
         .await
         .with_context(|_| GetJsBundleSnafu {
-            namespace: namespace.to_string(),
+            namespace: "<cluster>".to_string(),
             name: name.to_string(),
         })
 }
@@ -605,7 +615,7 @@ fn building_status(
         }),
         bundle_ref: Some(ResourceRef {
             name: bundle_name.to_string(),
-            namespace: fi.namespace(),
+            namespace: None,
             uid: None,
         }),
         message: Some(message.to_string()),
@@ -622,7 +632,7 @@ fn succeeded_status(
     FrontendIntegrationStatus {
         phase: Some(FrontendIntegrationPhase::Succeeded),
         observed_spec_hash: Some(spec_hash.to_string()),
-        observed_manifest_hash: Some(bundle.spec.manifest_hash.clone()),
+        observed_manifest_hash: bundle_manifest_hash(bundle),
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
         active_build: Some(ActiveBuildStatus {
             job_ref: Some(resource_ref(job)),
@@ -636,6 +646,31 @@ fn succeeded_status(
         message: Some("Build succeeded".to_string()),
         conditions: vec![],
     }
+}
+
+fn bundle_manifest_hash(bundle: &JSBundle) -> Option<String> {
+    if let Some(v) = bundle
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annos| annos.get(ANNO_MANIFEST_HASH))
+        .cloned()
+    {
+        return Some(v);
+    }
+
+    bundle
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_MANIFEST_HASH))
+        .map(|v| {
+            if v.starts_with("sha256:") {
+                v.clone()
+            } else {
+                format!("sha256:{}", v)
+            }
+        })
 }
 
 fn failed_status(

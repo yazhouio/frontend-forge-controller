@@ -1,13 +1,16 @@
 mod manifest;
 
+use base64::Engine as _;
 use frontend_forge_api::{
-    FrontendIntegration, JSBundle, JsBundleFile, JsBundleFileEncoding, JsBundleSpec,
-    JsBundleStatus, ManifestRenderError,
+    FrontendIntegration, JSBundle, JsBundleNamespacedKeyRef, JsBundleRawFromSpec, JsBundleSpec,
+    ManifestRenderError,
 };
 use frontend_forge_common::{
-    ANNO_BUILD_JOB, CommonError, LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH,
-    LABEL_SPEC_HASH, MANAGED_BY_VALUE, manifest_content_and_hash, serializable_hash,
+    ANNO_BUILD_JOB, ANNO_MANIFEST_HASH, CommonError, LABEL_FI_NAME, LABEL_MANAGED_BY,
+    LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE, bounded_name,
+    manifest_content_and_hash, serializable_hash,
 };
+use k8s_openapi::api::core::v1::ConfigMap;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, Resource};
 use serde::{Deserialize, Serialize};
@@ -34,6 +37,12 @@ enum Error {
     KubeClientInit { source: kube::Error },
     #[snafu(display("failed to read FrontendIntegration {namespace}/{name}: {source}"))]
     GetFrontendIntegration {
+        namespace: String,
+        name: String,
+        source: kube::Error,
+    },
+    #[snafu(display("failed to upsert bundle ConfigMap {namespace}/{name}: {source}"))]
+    UpsertBundleConfigMap {
         namespace: String,
         name: String,
         source: kube::Error,
@@ -77,6 +86,18 @@ enum Error {
     },
     #[snafu(display("build-service returned failure: {message}"))]
     BuildFailed { message: String },
+    #[snafu(display("failed to decode base64 artifact for {path}: {source}"))]
+    DecodeArtifactBase64 {
+        path: String,
+        source: base64::DecodeError,
+    },
+    #[snafu(display("artifact {path} is not valid UTF-8 after decoding: {source}"))]
+    ArtifactNotUtf8 {
+        path: String,
+        source: std::string::FromUtf8Error,
+    },
+    #[snafu(display("no suitable JS bundle artifact found (wanted key '{desired_key}')"))]
+    MissingBundleArtifact { desired_key: String },
     #[snafu(display("fi status.observed_spec_hash not available within grace period"))]
     StaleCheckTimeout,
 }
@@ -87,6 +108,8 @@ struct RunnerConfig {
     fi_name: String,
     spec_hash: String,
     jsbundle_name: String,
+    jsbundle_configmap_namespace: String,
+    jsbundle_config_key: String,
     build_service_base_url: String,
     build_service_timeout_seconds: u64,
     stale_check_grace_seconds: u64,
@@ -100,6 +123,10 @@ impl RunnerConfig {
             fi_name: required_env("FI_NAME")?,
             spec_hash: required_env_alias("SPEC_HASH", "MANIFEST_HASH")?,
             jsbundle_name: required_env("JSBUNDLE_NAME")?,
+            jsbundle_configmap_namespace: env::var("JSBUNDLE_CONFIGMAP_NAMESPACE")
+                .unwrap_or_else(|_| "extension-frontend-forge".to_string()),
+            jsbundle_config_key: env::var("JSBUNDLE_CONFIG_KEY")
+                .unwrap_or_else(|_| "index.js".to_string()),
             build_service_base_url: required_env("BUILD_SERVICE_BASE_URL")?,
             build_service_timeout_seconds: parse_env_u64("BUILD_SERVICE_TIMEOUT_SECONDS", 600)?,
             stale_check_grace_seconds: parse_env_u64("STALE_CHECK_GRACE_SECONDS", 30)?,
@@ -175,10 +202,13 @@ struct RemoteFile {
     path: String,
     encoding: String,
     content: String,
-    sha256: Option<String>,
-    size: Option<u64>,
+    #[serde(default)]
+    _sha256: Option<String>,
+    #[serde(default)]
+    _size: Option<u64>,
     #[serde(rename = "contentType")]
-    content_type: Option<String>,
+    #[serde(default)]
+    _content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -377,8 +407,30 @@ async fn run() -> Result<(), Error> {
     }
     let fi = fi.expect("checked above");
 
-    let bundle_api = Api::<JSBundle>::namespaced(kube, &cfg.fi_namespace);
-    upsert_jsbundle(&bundle_api, &cfg, &fi, &manifest_hash, files).await?;
+    let (bundle_key, bundle_content) = select_bundle_artifact(&cfg, files)?;
+    let configmap_name = bundle_configmap_name(&cfg.jsbundle_name);
+    let configmap_api =
+        Api::<ConfigMap>::namespaced(kube.clone(), &cfg.jsbundle_configmap_namespace);
+    upsert_bundle_configmap(
+        &configmap_api,
+        &cfg,
+        &fi,
+        &configmap_name,
+        &bundle_key,
+        &bundle_content,
+        &manifest_hash,
+    )
+    .await?;
+
+    let bundle_api = Api::<JSBundle>::all(kube);
+    upsert_jsbundle(
+        &bundle_api,
+        &cfg,
+        &configmap_name,
+        &bundle_key,
+        &manifest_hash,
+    )
+    .await?;
     info!(bundle = %cfg.jsbundle_name, "jsbundle upserted");
     Ok(())
 }
@@ -418,19 +470,20 @@ async fn stale_check(
     }
 }
 
-async fn upsert_jsbundle(
-    bundle_api: &Api<JSBundle>,
+async fn upsert_bundle_configmap(
+    configmap_api: &Api<ConfigMap>,
     cfg: &RunnerConfig,
     fi: &FrontendIntegration,
+    configmap_name: &str,
+    bundle_key: &str,
+    bundle_content: &str,
     manifest_hash: &str,
-    remote_files: Vec<RemoteFile>,
 ) -> Result<(), Error> {
-    let owner_ref = fi.controller_owner_ref(&());
-    let files = remote_files
-        .into_iter()
-        .map(convert_remote_file)
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let owner_refs = if cfg.jsbundle_configmap_namespace == cfg.fi_namespace {
+        fi.controller_owner_ref(&()).map(|o| vec![o])
+    } else {
+        None
+    };
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
@@ -451,24 +504,89 @@ async fn upsert_jsbundle(
 
     let mut annotations = BTreeMap::new();
     annotations.insert(ANNO_BUILD_JOB.to_string(), job_name_from_env());
+    annotations.insert(ANNO_MANIFEST_HASH.to_string(), manifest_hash.to_string());
+
+    let cm = ConfigMap {
+        metadata: kube::core::ObjectMeta {
+            name: Some(configmap_name.to_string()),
+            namespace: Some(cfg.jsbundle_configmap_namespace.clone()),
+            owner_references: owner_refs,
+            labels: Some(labels),
+            annotations: Some(annotations),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(
+            bundle_key.to_string(),
+            bundle_content.to_string(),
+        )])),
+        ..Default::default()
+    };
+
+    configmap_api
+        .patch(
+            configmap_name,
+            &PatchParams::apply("frontend-forge-builder-runner").force(),
+            &Patch::Apply(&cm),
+        )
+        .await
+        .with_context(|_| UpsertBundleConfigMapSnafu {
+            namespace: cfg.jsbundle_configmap_namespace.clone(),
+            name: configmap_name.to_string(),
+        })?;
+
+    Ok(())
+}
+
+async fn upsert_jsbundle(
+    bundle_api: &Api<JSBundle>,
+    cfg: &RunnerConfig,
+    configmap_name: &str,
+    bundle_key: &str,
+    manifest_hash: &str,
+) -> Result<(), Error> {
+    let mut labels = BTreeMap::new();
+    labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
+    labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
+    labels.insert(
+        LABEL_SPEC_HASH.to_string(),
+        cfg.spec_hash
+            .strip_prefix("sha256:")
+            .unwrap_or(&cfg.spec_hash)
+            .to_string(),
+    );
+    labels.insert(
+        LABEL_MANIFEST_HASH.to_string(),
+        manifest_hash
+            .strip_prefix("sha256:")
+            .unwrap_or(manifest_hash)
+            .to_string(),
+    );
+
+    let mut annotations = BTreeMap::new();
+    annotations.insert(ANNO_BUILD_JOB.to_string(), job_name_from_env());
+    annotations.insert(ANNO_MANIFEST_HASH.to_string(), manifest_hash.to_string());
 
     let bundle = JSBundle {
         metadata: kube::core::ObjectMeta {
             name: Some(cfg.jsbundle_name.clone()),
-            namespace: Some(cfg.fi_namespace.clone()),
-            owner_references: owner_ref.map(|o| vec![o]),
             labels: Some(labels),
             annotations: Some(annotations),
             ..Default::default()
         },
         spec: JsBundleSpec {
-            manifest_hash: manifest_hash.to_string(),
-            files,
+            raw: None,
+            raw_from: Some(JsBundleRawFromSpec {
+                config_map_key_ref: Some(JsBundleNamespacedKeyRef {
+                    key: bundle_key.to_string(),
+                    name: configmap_name.to_string(),
+                    namespace: cfg.jsbundle_configmap_namespace.clone(),
+                    optional: None,
+                }),
+                secret_key_ref: None,
+                url: None,
+            }),
         },
-        status: Some(JsBundleStatus {
-            ready: Some(true),
-            message: Some("built by frontend-forge-runner".to_string()),
-        }),
+        status: None,
     };
 
     bundle_api
@@ -479,35 +597,69 @@ async fn upsert_jsbundle(
         )
         .await
         .with_context(|_| UpsertJsBundleSnafu {
-            namespace: cfg.fi_namespace.clone(),
+            namespace: "<cluster>".to_string(),
             name: cfg.jsbundle_name.clone(),
         })?;
 
     Ok(())
 }
 
-fn convert_remote_file(remote: RemoteFile) -> Result<JsBundleFile, Error> {
-    let encoding = match remote.encoding.as_str() {
-        "base64" => JsBundleFileEncoding::Base64,
-        "utf8" | "text" | "plain" => JsBundleFileEncoding::Utf8,
-        other => {
-            return Err(Error::BuildFailed {
-                message: format!(
-                    "unsupported artifact encoding '{}' for {}",
-                    other, remote.path
-                ),
-            });
-        }
-    };
+fn bundle_configmap_name(jsbundle_name: &str) -> String {
+    bounded_name(&format!("{}-config", jsbundle_name), 63)
+}
 
-    Ok(JsBundleFile {
-        path: remote.path,
-        encoding,
-        content: remote.content,
-        sha256: remote.sha256,
-        size: remote.size,
-        content_type: remote.content_type,
-    })
+fn select_bundle_artifact(
+    cfg: &RunnerConfig,
+    remote_files: Vec<RemoteFile>,
+) -> Result<(String, String), Error> {
+    let desired_key = cfg.jsbundle_config_key.clone();
+    let selected_idx = remote_files
+        .iter()
+        .position(|f| f.path == desired_key)
+        .or_else(|| {
+            if remote_files.len() == 1 {
+                Some(0)
+            } else {
+                remote_files.iter().position(|f| f.path.ends_with(".js"))
+            }
+        })
+        .ok_or_else(|| Error::MissingBundleArtifact {
+            desired_key: desired_key.clone(),
+        })?;
+
+    let file = remote_files
+        .into_iter()
+        .nth(selected_idx)
+        .expect("selected index must exist");
+    let content = decode_remote_file_to_utf8(&file)?;
+    let key = if file.path.contains('/') {
+        desired_key
+    } else {
+        file.path
+    };
+    Ok((key, content))
+}
+
+fn decode_remote_file_to_utf8(remote: &RemoteFile) -> Result<String, Error> {
+    match remote.encoding.as_str() {
+        "utf8" | "text" | "plain" => Ok(remote.content.clone()),
+        "base64" => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(remote.content.as_bytes())
+                .context(DecodeArtifactBase64Snafu {
+                    path: remote.path.clone(),
+                })?;
+            String::from_utf8(bytes).context(ArtifactNotUtf8Snafu {
+                path: remote.path.clone(),
+            })
+        }
+        other => Err(Error::BuildFailed {
+            message: format!(
+                "unsupported artifact encoding '{}' for {}",
+                other, remote.path
+            ),
+        }),
+    }
 }
 
 fn job_name_from_env() -> String {
@@ -519,18 +671,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_base64_file() {
+    fn decodes_base64_file() {
         let file = RemoteFile {
             path: "index.js".to_string(),
             encoding: "base64".to_string(),
             content: "Zm9v".to_string(),
-            sha256: Some("abc".to_string()),
-            size: Some(3),
-            content_type: Some("application/javascript".to_string()),
+            _sha256: Some("abc".to_string()),
+            _size: Some(3),
+            _content_type: Some("application/javascript".to_string()),
         };
 
-        let converted = convert_remote_file(file).unwrap();
-        assert!(matches!(converted.encoding, JsBundleFileEncoding::Base64));
+        let decoded = decode_remote_file_to_utf8(&file).unwrap();
+        assert_eq!(decoded, "foo");
     }
 
     #[test]
@@ -539,11 +691,11 @@ mod tests {
             path: "index.js".to_string(),
             encoding: "gzip".to_string(),
             content: String::new(),
-            sha256: None,
-            size: None,
-            content_type: None,
+            _sha256: None,
+            _size: None,
+            _content_type: None,
         };
 
-        assert!(convert_remote_file(file).is_err());
+        assert!(decode_remote_file_to_utf8(&file).is_err());
     }
 }

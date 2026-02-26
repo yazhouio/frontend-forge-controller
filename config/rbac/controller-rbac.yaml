@@ -15,7 +15,7 @@ rules:
   - apiGroups: ["frontend-forge.io"]
     resources: ["frontendintegrations/status"]
     verbs: ["get", "patch", "update"]
-  - apiGroups: ["frontend-forge.io"]
+  - apiGroups: ["extensions.kubesphere.io"]
     resources: ["jsbundles"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]

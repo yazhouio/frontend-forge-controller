@@ -9,7 +9,7 @@
 1. Controller **不再渲染 Manifest**，也不依赖 Manifest `ConfigMap/Secret`
 2. Controller 的幂等与构建触发基于 **FI.spec 的 canonical hash（spec_hash）**
 3. Runner 在 Job 内部读取 FI，并按 `spec.builder.engineVersion` 将 FI 转换为 Manifest
-4. Runner 计算 **manifest_hash**，用于 build-service 调用与 `JSBundle.spec.manifest_hash`
+4. Runner 计算 **manifest_hash**，用于 build-service 调用与 `JSBundle` metadata（label/annotation）
 5. Controller 通过 `JSBundle` 的 `spec-hash` label 判断产物是否属于当前 FI 期望版本
 
 因此，当前实现存在两个 hash（职责不同）：
@@ -47,21 +47,28 @@
   - 调用 build-service
   - stale-check 后创建/更新 `JSBundle`
 
-### 2.3 JSBundle（产物 CR）
+### 2.3 JSBundle（第三方产物 CR）
 
-- 固定名称更新（当前代码使用 `fi-<fi-name>`）
+- 第三方 CRD：`extensions.kubesphere.io/v1alpha1`, `kind=JSBundle`
+- **Cluster-scoped**（不是 namespaced）
+- 固定名称更新（当前代码使用 `fi-<fi-namespace>-<fi-name>`，避免跨 namespace 重名冲突）
 - 由 runner 创建/更新
-- 存储：
-  - `spec.manifest_hash`
-  - `spec.files`
-- metadata labels 同时记录 `spec_hash` 与 `manifest_hash`（用于 controller 判定与追溯）
+- `spec.rawFrom.configMapKeyRef` 指向 runner 写入的产物 ConfigMap（示例 key: `index.js`）
+- metadata labels/annotations 记录 `spec_hash` 与 `manifest_hash`（用于 controller 判定与追溯）
+
+### 2.4 Bundle ConfigMap（runner 写入的产物载体）
+
+- runner 将编译后的 JS 内容写入 ConfigMap（默认 namespace: `extension-frontend-forge-config`）
+- JSBundle `rawFrom.configMapKeyRef` 引用该 ConfigMap
+- 当 ConfigMap namespace 与 FI namespace 相同时，runner 会设置 ownerRef 到 FI；跨 namespace 时不设置 ownerRef
 
 ## 3. OwnerReference 与状态引用
 
 当前实现的 owner 关系：
 
 - `Job.ownerReference -> FrontendIntegration`
-- `JSBundle.ownerReference -> FrontendIntegration`
+- `JSBundle` 为第三方 cluster-scoped CR，当前实现 **不设置 ownerReference 到 FI**
+- 产物 ConfigMap 仅在与 FI 同 namespace 时设置 `ownerReference -> FrontendIntegration`
 
 说明：
 
@@ -102,9 +109,8 @@
 用途：
 
 - build-service `POST /v1/builds` 请求中的 `manifestHash`
-- `JSBundle.spec.manifest_hash`
-- `JSBundle` label `frontend-forge.io/manifest-hash`
-- `FI.status.observed_manifest_hash`（在成功态由 controller 从 bundle 回写）
+- `JSBundle` metadata label/annotation `frontend-forge.io/manifest-hash`
+- `FI.status.observed_manifest_hash`（在成功态由 controller 从 bundle metadata 回写）
 
 ### 4.3 Label 值格式（实现细节）
 
@@ -152,7 +158,10 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 
 - Watch `FrontendIntegration`
 - Watch owned `Job`
-- Watch owned `JSBundle`
+
+说明：
+
+- 当前未使用 `Watch owned JSBundle`，因为第三方 `JSBundle` 为 cluster-scoped，且不会设置 ownerRef 到 namespaced 的 FI
 
 ### 6.2 Reconcile 主流程
 
@@ -163,7 +172,7 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
    - `message=Disabled`
    - 保留已有 hash/bundle 引用（尽量不破坏当前状态）
 4. 计算 `spec_hash = sha256(canonical_json(FI.spec))`
-5. 计算期望 `JSBundle` 名称（当前实现：`fi-<fi-name>`）
+5. 计算期望 `JSBundle` 名称（当前实现：`fi-<fi-namespace>-<fi-name>`）
 6. 判断是否需要新构建：
    - `observed_spec_hash`（兼容 fallback `observed_manifest_hash`）与 `spec_hash` 不同
    - 首次无状态
@@ -178,7 +187,7 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
    - 成功则回写：
      - `phase=Succeeded`
      - `observed_spec_hash`
-     - `observed_manifest_hash = JSBundle.spec.manifest_hash`
+     - `observed_manifest_hash = JSBundle metadata 中的 manifest-hash`
      - `bundle_ref`
 
 ## 7. Runner 流程（当前代码）
@@ -191,6 +200,8 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 - `FI_NAME`
 - `SPEC_HASH`
 - `JSBUNDLE_NAME`
+- `JSBUNDLE_CONFIGMAP_NAMESPACE`（默认 `extension-frontend-forge-config`）
+- `JSBUNDLE_CONFIG_KEY`（默认 `index.js`）
 - `BUILD_SERVICE_BASE_URL`
 - `BUILD_SERVICE_TIMEOUT_SECONDS`
 - `STALE_CHECK_GRACE_SECONDS`
@@ -211,15 +222,22 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
    - 轮询构建状态
    - 拉取产物文件列表
 6. 执行 stale-check（对齐 `FI.status.observed_spec_hash`）
-7. 创建/更新固定名 `JSBundle`
-8. 退出，由 Controller 回写 FI 状态
+7. 选择入口 JS 产物（默认 key `index.js`）
+8. 创建/更新产物 ConfigMap（写入 JS 内容）
+9. 创建/更新 cluster-scoped `JSBundle`（`spec.rawFrom.configMapKeyRef` 指向 ConfigMap）
+10. 退出，由 Controller 回写 FI 状态
 
-### 7.3 JSBundle 写入内容（当前实现）
+### 7.3 JSBundle / ConfigMap 写入内容（当前实现）
+
+产物 ConfigMap：
+
+- `data["index.js"]`（或配置指定 key）
 
 `JSBundle.spec`：
 
-- `manifest_hash`
-- `files[]`
+- `rawFrom.configMapKeyRef.name`
+- `rawFrom.configMapKeyRef.namespace`
+- `rawFrom.configMapKeyRef.key`
 
 `JSBundle.metadata.labels`（核心）：
 
@@ -231,6 +249,7 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 `JSBundle.metadata.annotations`：
 
 - `frontend-forge.io/build-job`（runner 从 `HOSTNAME` 推导）
+- `frontend-forge.io/manifest-hash`（完整 hash，含 `sha256:` 前缀）
 
 ## 8. FI -> Manifest 转换（Runner 多版本支持）
 
@@ -305,7 +324,8 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
   - label/annotation 常量（含 `spec-hash`）
   - 名称生成（Job/Bundle）
 - `crates/api`
-  - `FrontendIntegration` / `JSBundle` CRD 类型
+  - `FrontendIntegration` CRD 类型
+  - 第三方 `JSBundle` CR 类型（最小字段子集，用于客户端交互）
   - `ManifestRenderError`（供 runner 复用）
   - 不再包含 Manifest 渲染实现
 - `crates/controller`
@@ -315,12 +335,12 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
   - build-service 客户端
   - FI -> Manifest 版本分发（`manifest.rs`）
   - v1 渲染实现（`manifest/v1.rs`）
-  - stale-check + JSBundle upsert
+  - stale-check + ConfigMap/JSBundle upsert
 
 ## 11. 当前实现边界（MVP）
 
 - 无 Manifest `ConfigMap` / `Secret`
-- `JSBundle` 名称当前固定为 `fi-<fi-name>`（未实现自定义 bundleName）
+- `JSBundle` 名称当前固定为 `fi-<fi-namespace>-<fi-name>`（未实现自定义 bundleName）
 - `FI.status.conditions` 结构已定义，但当前 controller 主要使用 `phase/message`
 - 大产物分片/外部对象存储未实现
 
@@ -328,5 +348,5 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 
 1. 增加 `v2` engine renderer，并补版本迁移策略文档
 2. 为 `spec_hash` / `manifest_hash` 增加集成测试（旧 Job 晚完成覆盖保护）
-3. 若接入外部 `JSBundle` CRD，增加 schema 适配层
+3. 完善第三方 `JSBundle` CRD 的 typed schema（当前仅使用最小字段子集）
 4. 补充 metrics / Event 上报与可观测性

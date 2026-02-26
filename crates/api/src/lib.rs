@@ -8,6 +8,8 @@ use snafu::Snafu;
 pub const API_GROUP: &str = "frontend-forge.io";
 pub const API_VERSION: &str = "v1alpha1";
 pub const JSBUNDLE_PLURAL: &str = "jsbundles";
+pub const JSBUNDLE_API_GROUP: &str = "extensions.kubesphere.io";
+pub const JSBUNDLE_API_VERSION: &str = "v1alpha1";
 
 #[derive(CustomResource, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[kube(
@@ -262,45 +264,54 @@ pub struct FrontendIntegrationStatus {
 
 #[derive(CustomResource, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[kube(
-    group = "frontend-forge.io",
+    group = "extensions.kubesphere.io",
     version = "v1alpha1",
     kind = "JSBundle",
     plural = "jsbundles",
-    namespaced,
     status = "JsBundleStatus"
 )]
 pub struct JsBundleSpec {
-    pub manifest_hash: String,
-    #[serde(default)]
-    pub files: Vec<JsBundleFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "rawFrom")]
+    pub raw_from: Option<JsBundleRawFromSpec>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct JsBundleFile {
-    pub path: String,
-    pub encoding: JsBundleFileEncoding,
-    pub content: String,
+pub struct JsBundleRawFromSpec {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "configMapKeyRef"
+    )]
+    pub config_map_key_ref: Option<JsBundleNamespacedKeyRef>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "secretKeyRef"
+    )]
+    pub secret_key_ref: Option<JsBundleNamespacedKeyRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum JsBundleFileEncoding {
-    Utf8,
-    Base64,
+pub struct JsBundleNamespacedKeyRef {
+    pub key: String,
+    pub name: String,
+    pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
 pub struct JsBundleStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ready: Option<bool>,
+    pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
+    pub link: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Value>,
 }
 
 impl FrontendIntegrationSpec {
