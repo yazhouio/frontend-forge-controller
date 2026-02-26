@@ -456,7 +456,6 @@ dependencies = [
 name = "frontend-forge-runner"
 version = "0.1.0"
 dependencies = [
- "base64",
  "frontend-forge-api",
  "frontend-forge-common",
  "k8s-openapi",

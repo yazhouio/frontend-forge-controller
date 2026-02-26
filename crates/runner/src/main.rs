@@ -1,6 +1,5 @@
 mod manifest;
 
-use base64::Engine as _;
 use frontend_forge_api::{
     FrontendIntegration, JSBundle, JsBundleNamespacedKeyRef, JsBundleRawFromSpec, JsBundleSpec,
     ManifestRenderError,
@@ -13,7 +12,7 @@ use frontend_forge_common::{
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, Resource};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use snafu::{ResultExt, Snafu};
 use std::collections::BTreeMap;
 use std::env;
@@ -86,16 +85,6 @@ enum Error {
     },
     #[snafu(display("build-service returned failure: {message}"))]
     BuildFailed { message: String },
-    #[snafu(display("failed to decode base64 artifact for {path}: {source}"))]
-    DecodeArtifactBase64 {
-        path: String,
-        source: base64::DecodeError,
-    },
-    #[snafu(display("artifact {path} is not valid UTF-8 after decoding: {source}"))]
-    ArtifactNotUtf8 {
-        path: String,
-        source: std::string::FromUtf8Error,
-    },
     #[snafu(display("no suitable JS bundle artifact found (wanted key '{desired_key}')"))]
     MissingBundleArtifact { desired_key: String },
     #[snafu(display("fi status.observed_spec_hash not available within grace period"))]
@@ -104,7 +93,6 @@ enum Error {
 
 #[derive(Clone, Debug)]
 struct RunnerConfig {
-    work_namespace: String,
     fi_name: String,
     spec_hash: String,
     jsbundle_name: String,
@@ -113,14 +101,11 @@ struct RunnerConfig {
     build_service_base_url: String,
     build_service_timeout_seconds: u64,
     stale_check_grace_seconds: u64,
-    poll_interval_seconds: u64,
 }
 
 impl RunnerConfig {
     fn from_env() -> Result<Self, Error> {
         Ok(Self {
-            work_namespace: env::var("WORK_NAMESPACE")
-                .unwrap_or_else(|_| "extension-frontend-forge".to_string()),
             fi_name: required_env("FI_NAME")?,
             spec_hash: required_env_alias("SPEC_HASH", "MANIFEST_HASH")?,
             jsbundle_name: required_env("JSBUNDLE_NAME")?,
@@ -131,7 +116,6 @@ impl RunnerConfig {
             build_service_base_url: required_env("BUILD_SERVICE_BASE_URL")?,
             build_service_timeout_seconds: parse_env_u64("BUILD_SERVICE_TIMEOUT_SECONDS", 600)?,
             stale_check_grace_seconds: parse_env_u64("STALE_CHECK_GRACE_SECONDS", 30)?,
-            poll_interval_seconds: parse_env_u64("BUILD_STATUS_POLL_SECONDS", 2)?,
         })
     }
 }
@@ -158,67 +142,21 @@ fn parse_env_u64(key: &'static str, default: u64) -> Result<u64, Error> {
 struct BuildServiceClient {
     base_url: String,
     client: reqwest::Client,
-    poll_interval: Duration,
-}
-
-#[derive(Debug, Serialize)]
-struct CreateBuildRequest {
-    #[serde(rename = "manifestHash")]
-    manifest_hash: String,
-    manifest: String,
-    context: BuildContext,
-}
-
-#[derive(Debug, Serialize)]
-struct BuildContext {
-    namespace: String,
-    #[serde(rename = "frontendIntegration")]
-    frontend_integration: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateBuildResponse {
-    #[serde(rename = "buildId")]
-    build_id: String,
-    status: BuildState,
-}
-
-#[derive(Debug, Deserialize)]
-struct BuildStatusResponse {
-    #[serde(rename = "buildId")]
-    _build_id: String,
-    status: BuildState,
+struct ProjectBuildResponse {
+    ok: bool,
+    #[serde(default)]
     message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BuildFilesResponse {
-    #[serde(rename = "buildId")]
-    _build_id: String,
+    #[serde(default)]
     files: Vec<RemoteFile>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RemoteFile {
     path: String,
-    encoding: String,
     content: String,
-    #[serde(default)]
-    _sha256: Option<String>,
-    #[serde(default)]
-    _size: Option<u64>,
-    #[serde(rename = "contentType")]
-    #[serde(default)]
-    _content_type: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum BuildState {
-    Pending,
-    Running,
-    Succeeded,
-    Failed,
 }
 
 impl BuildServiceClient {
@@ -232,111 +170,39 @@ impl BuildServiceClient {
         Ok(Self {
             base_url: cfg.build_service_base_url.trim_end_matches('/').to_string(),
             client,
-            poll_interval: Duration::from_secs(cfg.poll_interval_seconds),
         })
     }
 
-    async fn create_build(
-        &self,
-        cfg: &RunnerConfig,
-        manifest_hash: &str,
-        manifest: &str,
-    ) -> Result<CreateBuildResponse, Error> {
-        let url = format!("{}/v1/builds", self.base_url);
-        let req = CreateBuildRequest {
-            manifest_hash: manifest_hash.to_string(),
-            manifest: manifest.to_string(),
-            context: BuildContext {
-                namespace: cfg.work_namespace.clone(),
-                frontend_integration: cfg.fi_name.clone(),
-            },
-        };
-
-        let resp =
-            self.client
-                .post(&url)
-                .json(&req)
-                .send()
-                .await
-                .context(BuildServiceRequestSnafu {
-                    operation: "create_build",
-                    url: url.clone(),
-                })?;
-        let resp = resp
-            .error_for_status()
-            .context(BuildServiceResponseStatusSnafu {
-                operation: "create_build",
-                url: url.clone(),
-            })?;
-        resp.json().await.context(BuildServiceDecodeSnafu {
-            operation: "create_build",
-            url,
-        })
-    }
-
-    async fn wait_for_completion(&self, build_id: &str) -> Result<(), Error> {
-        loop {
-            let status = self.get_status(build_id).await?;
-            match status.status {
-                BuildState::Pending | BuildState::Running => {
-                    sleep(self.poll_interval).await;
-                }
-                BuildState::Succeeded => return Ok(()),
-                BuildState::Failed => {
-                    return Err(Error::BuildFailed {
-                        message: status
-                            .message
-                            .unwrap_or_else(|| "build-service returned FAILED".to_string()),
-                    });
-                }
-            }
-        }
-    }
-
-    async fn get_status(&self, build_id: &str) -> Result<BuildStatusResponse, Error> {
-        let url = format!("{}/v1/builds/{}", self.base_url, build_id);
+    async fn build_project(&self, manifest: &str) -> Result<Vec<RemoteFile>, Error> {
+        let url = format!("{}/project/build", self.base_url);
         let resp = self
             .client
-            .get(&url)
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(manifest.to_string())
             .send()
             .await
             .context(BuildServiceRequestSnafu {
-                operation: "get_build_status",
+                operation: "project_build",
                 url: url.clone(),
             })?;
         let resp = resp
             .error_for_status()
             .context(BuildServiceResponseStatusSnafu {
-                operation: "get_build_status",
+                operation: "project_build",
                 url: url.clone(),
             })?;
-        resp.json().await.context(BuildServiceDecodeSnafu {
-            operation: "get_build_status",
-            url,
-        })
-    }
-
-    async fn fetch_files(&self, build_id: &str) -> Result<Vec<RemoteFile>, Error> {
-        let url = format!("{}/v1/builds/{}/files", self.base_url, build_id);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context(BuildServiceRequestSnafu {
-                operation: "get_build_files",
-                url: url.clone(),
-            })?;
-        let resp = resp
-            .error_for_status()
-            .context(BuildServiceResponseStatusSnafu {
-                operation: "get_build_files",
-                url: url.clone(),
-            })?;
-        let payload: BuildFilesResponse = resp.json().await.context(BuildServiceDecodeSnafu {
-            operation: "get_build_files",
+        let payload: ProjectBuildResponse = resp.json().await.context(BuildServiceDecodeSnafu {
+            operation: "project_build",
             url,
         })?;
+        if !payload.ok {
+            return Err(Error::BuildFailed {
+                message: payload
+                    .message
+                    .unwrap_or_else(|| "build-service returned ok=false".to_string()),
+            });
+        }
         Ok(payload.files)
     }
 }
@@ -394,13 +260,8 @@ async fn run() -> Result<(), Error> {
         manifest_hash = %manifest_hash,
         "starting build runner"
     );
-    let create = build_client
-        .create_build(&cfg, &manifest_hash, &manifest)
-        .await?;
-    info!(build_id = %create.build_id, status = ?create.status, "build created");
-    build_client.wait_for_completion(&create.build_id).await?;
-    let files = build_client.fetch_files(&create.build_id).await?;
-    info!(build_id = %create.build_id, files = files.len(), "build artifacts fetched");
+    let files = build_client.build_project(&manifest).await?;
+    info!(files = files.len(), "build artifacts fetched");
     let fi = stale_check(&fi_api, &cfg).await?;
     if fi.is_none() {
         warn!("build became stale; exiting without writing JSBundle");
@@ -638,25 +499,7 @@ fn select_bundle_artifact(
 }
 
 fn decode_remote_file_to_utf8(remote: &RemoteFile) -> Result<String, Error> {
-    match remote.encoding.as_str() {
-        "utf8" | "text" | "plain" => Ok(remote.content.clone()),
-        "base64" => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(remote.content.as_bytes())
-                .context(DecodeArtifactBase64Snafu {
-                    path: remote.path.clone(),
-                })?;
-            String::from_utf8(bytes).context(ArtifactNotUtf8Snafu {
-                path: remote.path.clone(),
-            })
-        }
-        other => Err(Error::BuildFailed {
-            message: format!(
-                "unsupported artifact encoding '{}' for {}",
-                other, remote.path
-            ),
-        }),
-    }
+    Ok(remote.content.clone())
 }
 
 fn job_name_from_env() -> String {
@@ -668,31 +511,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_base64_file() {
+    fn decodes_plain_file_passthrough() {
         let file = RemoteFile {
             path: "index.js".to_string(),
-            encoding: "base64".to_string(),
-            content: "Zm9v".to_string(),
-            _sha256: Some("abc".to_string()),
-            _size: Some(3),
-            _content_type: Some("application/javascript".to_string()),
+            content: "console.log('ok')".to_string(),
         };
 
         let decoded = decode_remote_file_to_utf8(&file).unwrap();
-        assert_eq!(decoded, "foo");
+        assert_eq!(decoded, "console.log('ok')");
     }
 
     #[test]
-    fn rejects_unknown_encoding() {
-        let file = RemoteFile {
-            path: "index.js".to_string(),
-            encoding: "gzip".to_string(),
-            content: String::new(),
-            _sha256: None,
-            _size: None,
-            _content_type: None,
+    fn selects_js_fallback_artifact() {
+        let cfg = RunnerConfig {
+            fi_name: "demo".to_string(),
+            spec_hash: "sha256:abc".to_string(),
+            jsbundle_name: "fi-demo".to_string(),
+            jsbundle_configmap_namespace: "extension-frontend-forge-config".to_string(),
+            jsbundle_config_key: "index.js".to_string(),
+            build_service_base_url: "http://builder".to_string(),
+            build_service_timeout_seconds: 30,
+            stale_check_grace_seconds: 30,
         };
 
-        assert!(decode_remote_file_to_utf8(&file).is_err());
+        let (key, content) = select_bundle_artifact(
+            &cfg,
+            vec![
+                RemoteFile {
+                    path: "style.css".to_string(),
+                    content: "body{}".to_string(),
+                },
+                RemoteFile {
+                    path: "bundle/main.js".to_string(),
+                    content: "console.log('js')".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(key, "index.js");
+        assert_eq!(content, "console.log('js')");
     }
 }

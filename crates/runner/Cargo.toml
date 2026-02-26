@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-base64.workspace = true
 frontend-forge-api = { path = "../api" }
 frontend-forge-common = { path = "../common" }
 k8s-openapi.workspace = true

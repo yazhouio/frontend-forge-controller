@@ -485,11 +485,6 @@ fn make_build_job(
             ..Default::default()
         },
         EnvVar {
-            name: "WORK_NAMESPACE".to_string(),
-            value: Some(config.work_namespace.clone()),
-            ..Default::default()
-        },
-        EnvVar {
             name: "JSBUNDLE_CONFIGMAP_NAMESPACE".to_string(),
             value: Some(config.jsbundle_configmap_namespace.clone()),
             ..Default::default()

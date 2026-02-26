@@ -109,7 +109,7 @@
 
 用途：
 
-- build-service `POST /v1/builds` 请求中的 `manifestHash`
+- build-service `POST /project/build` 请求体（Manifest JSON）对应的追溯 hash（runner 本地计算）
 - `JSBundle` metadata label/annotation `frontend-forge.io/manifest-hash`
 - `FI.status.observed_manifest_hash`（在成功态由 controller 从 bundle metadata 回写）
 
@@ -197,7 +197,6 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 
 当前 Job env（核心字段）：
 
-- `WORK_NAMESPACE`（默认 `extension-frontend-forge`）
 - `FI_NAME`
 - `SPEC_HASH`
 - `JSBUNDLE_NAME`
@@ -219,9 +218,8 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 3. 按 `spec.builder.engineVersion` 将 FI 转换成 Manifest
 4. 计算 `manifest_hash`
 5. 调用 build-service：
-   - `POST /v1/builds`（传 `manifestHash + manifest`）
-   - 轮询构建状态
-   - 拉取产物文件列表
+   - `POST /project/build`（请求体即 Manifest JSON）
+   - 响应 `{ ok, files }`
 6. 执行 stale-check（对齐 `FI.status.observed_spec_hash`）
 7. 选择入口 JS 产物（默认 key `index.js`）
 8. 创建/更新产物 ConfigMap（写入 JS 内容）
@@ -270,52 +268,32 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 
 ## 9. build-service HTTP 契约（当前实现使用）
 
-### 9.1 创建构建
+单请求同步构建：
 
-`POST /v1/builds`
+`POST /project/build`
 
-```json
-{
-  "manifestHash": "sha256:...",
-  "manifest": "{...json string...}",
-  "context": {
-    "namespace": "default",
-    "frontendIntegration": "demo"
-  }
-}
-```
+请求体：
 
-### 9.2 查询状态
+- 直接发送 Manifest JSON（`Content-Type: application/json`）
 
-`GET /v1/builds/{id}`
+响应体：
 
 ```json
 {
-  "buildId": "bld_123",
-  "status": "PENDING|RUNNING|SUCCEEDED|FAILED",
-  "message": "optional"
-}
-```
-
-### 9.3 获取产物文件
-
-`GET /v1/builds/{id}/files`
-
-```json
-{
-  "buildId": "bld_123",
+  "ok": true,
   "files": [
     {
       "path": "index.js",
-      "encoding": "base64",
-      "content": "...",
-      "sha256": "...",
-      "size": 123,
-      "contentType": "application/javascript"
+      "content": "console.log('hello')"
     }
   ]
 }
 ```
+
+约定：
+
+- `ok=false` 时 runner 视为构建失败（可带 `message` 字段）
+- `files[].content` 为纯文本内容（当前不再处理 `encoding`）
 
 ## 10. Rust 工程结构（当前实现）
 
