@@ -28,8 +28,6 @@ spec:
               value: ghcr.io/example/frontend-forge-runner:latest
             - name: RUNNER_SERVICE_ACCOUNT
               value: frontend-forge-runner
-            - name: WORK_NAMESPACE
-              value: extension-frontend-forge
             - name: BUILD_SERVICE_BASE_URL
               value: http://build-service.extension-frontend-forge.svc.cluster.local
             - name: JSBUNDLE_CONFIGMAP_NAMESPACE
