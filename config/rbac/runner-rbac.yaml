@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frontend-forge-runner
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: frontend-forge-runner
+  namespace: default
+rules:
+  - apiGroups: ["frontend-forge.io"]
+    resources: ["frontendintegrations"]
+    verbs: ["get"]
+  - apiGroups: ["frontend-forge.io"]
+    resources: ["jsbundles"]
+    verbs: ["get", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: frontend-forge-runner
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: frontend-forge-runner
+subjects:
+  - kind: ServiceAccount
+    name: frontend-forge-runner
+    namespace: default

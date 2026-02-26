@@ -1,0 +1,20 @@
+apiVersion: frontend-forge.io/v1alpha1
+kind: FrontendIntegration
+metadata:
+  name: demo-fi
+  namespace: default
+spec:
+  bundle_name: demo-fi
+  source:
+    name: demo-plugin
+    version: 1.0.0
+    entry: src/index.ts
+    dependencies:
+      react: "^18.3.0"
+      "react-dom": "^18.3.0"
+    files:
+      - path: src/index.ts
+        content: |
+          export default function Demo() {
+            return 'hello frontend-forge';
+          }

@@ -1,0 +1,19 @@
+[package]
+name = "frontend-forge-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+futures.workspace = true
+frontend-forge-api = { path = "../api" }
+frontend-forge-common = { path = "../common" }
+k8s-openapi.workspace = true
+kube.workspace = true
+kube-runtime.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
