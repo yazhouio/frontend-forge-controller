@@ -420,6 +420,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "snafu",
 ]
 
 [[package]]
@@ -461,6 +462,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "snafu",
  "tokio",
  "tracing",

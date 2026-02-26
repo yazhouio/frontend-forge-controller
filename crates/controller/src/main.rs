@@ -4,17 +4,14 @@ use frontend_forge_api::{
     JSBundle, ResourceRef,
 };
 use frontend_forge_common::{
-    ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, DEFAULT_MANIFEST_FILENAME,
-    DEFAULT_MANIFEST_MOUNT_PATH, LABEL_BUILD_KIND, LABEL_FI_NAME, LABEL_MANAGED_BY,
-    LABEL_MANIFEST_HASH, MANAGED_BY_VALUE, MAX_SECRET_PAYLOAD_BYTES, default_bundle_name, job_name,
-    manifest_content_and_hash, secret_name, time_nonce,
+    ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, LABEL_BUILD_KIND, LABEL_FI_NAME,
+    LABEL_MANAGED_BY, LABEL_SPEC_HASH, MANAGED_BY_VALUE, default_bundle_name, job_name,
+    serializable_hash, time_nonce,
 };
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::JobStatus;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::{
-    Container, EnvVar, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Volume, VolumeMount,
-};
+use k8s_openapi::api::core::v1::{Container, EnvVar, PodSpec, PodTemplateSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube::api::{ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client, Resource, ResourceExt};
@@ -30,12 +27,10 @@ use tracing::{error, info, warn};
 
 #[derive(Debug, Snafu)]
 enum Error {
-    #[snafu(display("manifest/hash error: {source}"))]
+    #[snafu(display("spec/hash error: {source}"))]
     Common { source: CommonError },
     #[snafu(display("missing namespace for FrontendIntegration {name}"))]
     MissingNamespace { name: String },
-    #[snafu(display("manifest payload exceeds secret size limit: {bytes} bytes"))]
-    ManifestTooLarge { bytes: usize },
     #[snafu(display("failed to initialize Kubernetes client: {source}"))]
     KubeClientInit { source: kube::Error },
     #[snafu(display("failed to patch FrontendIntegration status {namespace}/{name}: {source}"))]
@@ -45,12 +40,12 @@ enum Error {
         source: kube::Error,
     },
     #[snafu(display(
-        "failed to list Jobs in {namespace} for FrontendIntegration {fi_name} and manifestHash {manifest_hash}: {source}"
+        "failed to list Jobs in {namespace} for FrontendIntegration {fi_name} and specHash {spec_hash}: {source}"
     ))]
     ListJobsForHash {
         namespace: String,
         fi_name: String,
-        manifest_hash: String,
+        spec_hash: String,
         source: kube::Error,
     },
     #[snafu(display("failed to get JSBundle {namespace}/{name}: {source}"))]
@@ -67,18 +62,6 @@ enum Error {
     },
     #[snafu(display("failed to get existing Job after conflict {namespace}/{name}: {source}"))]
     GetJobAfterConflict {
-        namespace: String,
-        name: String,
-        source: kube::Error,
-    },
-    #[snafu(display("failed to create Secret {namespace}/{name}: {source}"))]
-    CreateSecret {
-        namespace: String,
-        name: String,
-        source: kube::Error,
-    },
-    #[snafu(display("failed to get existing Secret after conflict {namespace}/{name}: {source}"))]
-    GetSecretAfterConflict {
         namespace: String,
         name: String,
         source: kube::Error,
@@ -185,28 +168,30 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
 
     let fi_api = Api::<FrontendIntegration>::namespaced(client.clone(), &ns);
     let job_api = Api::<Job>::namespaced(client.clone(), &ns);
-    let secret_api = Api::<Secret>::namespaced(client.clone(), &ns);
     let bundle_api = Api::<JSBundle>::namespaced(client.clone(), &ns);
 
     if fi.meta().deletion_timestamp.is_some() {
         return Ok(Action::await_change());
     }
 
-    if fi.spec.paused() {
+    if !fi.spec.enabled() {
         patch_fi_status(
             &fi_api,
             &fi,
             FrontendIntegrationStatus {
                 phase: Some(FrontendIntegrationPhase::Pending),
+                observed_spec_hash: fi
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.observed_spec_hash.clone()),
                 observed_manifest_hash: fi
                     .status
                     .as_ref()
                     .and_then(|s| s.observed_manifest_hash.clone()),
                 observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-                observed_force_rebuild_token: fi.spec.force_rebuild_token.clone(),
                 active_build: fi.status.as_ref().and_then(|s| s.active_build.clone()),
                 bundle_ref: fi.status.as_ref().and_then(|s| s.bundle_ref.clone()),
-                message: Some("Paused".to_string()),
+                message: Some("Disabled".to_string()),
                 conditions: vec![],
             },
         )
@@ -214,61 +199,32 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
         return Ok(Action::await_change());
     }
 
-    let (manifest_content, manifest_hash) =
-        manifest_content_and_hash(&fi.spec.source).context(CommonSnafu)?;
-    if manifest_content.len() > MAX_SECRET_PAYLOAD_BYTES {
-        let status = failed_status(
-            &fi,
-            &manifest_hash,
-            format!(
-                "manifest payload too large for Secret: {} bytes",
-                manifest_content.len()
-            ),
-        );
-        patch_fi_status(&fi_api, &fi, status).await?;
-        return Err(Error::ManifestTooLarge {
-            bytes: manifest_content.len(),
-        });
-    }
+    let spec_hash = serializable_hash(&fi.spec).context(CommonSnafu)?;
 
-    let desired_bundle_name = fi
-        .spec
-        .bundle_name
-        .clone()
-        .unwrap_or_else(|| default_bundle_name(&fi_name));
+    let desired_bundle_name = default_bundle_name(&fi_name);
 
-    let needs_build = needs_new_build(&fi, &manifest_hash);
+    let needs_build = needs_new_build(&fi, &spec_hash);
     if needs_build {
-        let running_or_pending = find_job_for_hash(&job_api, &ns, &fi_name, &manifest_hash).await?;
+        let running_or_pending = find_job_for_hash(&job_api, &ns, &fi_name, &spec_hash).await?;
         let chosen_job = if let Some(job) = running_or_pending {
             job
         } else {
             let nonce = time_nonce();
-            let job_name = job_name(&fi_name, &manifest_hash, &nonce);
-            let secret_name = secret_name(&fi_name, &manifest_hash, &nonce);
+            let job_name = job_name(&fi_name, &spec_hash, &nonce);
             let desired_job = make_build_job(
                 &fi,
                 &ctx.config,
                 &job_name,
-                &secret_name,
                 &desired_bundle_name,
-                &manifest_hash,
+                &spec_hash,
             );
             let created_job = create_or_get_job(&job_api, &ns, desired_job, &job_name).await?;
-            let desired_secret = make_manifest_secret(
-                &fi,
-                &created_job,
-                &secret_name,
-                &manifest_hash,
-                &manifest_content,
-            );
-            create_or_get_secret(&secret_api, &ns, desired_secret, &secret_name).await?;
             created_job
         };
 
         let status = building_status(
             &fi,
-            &manifest_hash,
+            &spec_hash,
             &desired_bundle_name,
             &chosen_job,
             "Build job scheduled",
@@ -286,7 +242,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
         &bundle_api,
         &ns,
         &desired_bundle_name,
-        &manifest_hash,
+        &spec_hash,
         ctx.config.reconcile_requeue_seconds,
     )
     .await?;
@@ -294,17 +250,18 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
     Ok(action)
 }
 
-fn needs_new_build(fi: &FrontendIntegration, manifest_hash: &str) -> bool {
+fn needs_new_build(fi: &FrontendIntegration, spec_hash: &str) -> bool {
     let status = fi.status.as_ref();
-    let observed_hash = status.and_then(|s| s.observed_manifest_hash.as_deref());
-    let observed_force = status.and_then(|s| s.observed_force_rebuild_token.as_deref());
+    let observed_hash = status
+        .and_then(|s| s.observed_spec_hash.as_deref())
+        .or_else(|| status.and_then(|s| s.observed_manifest_hash.as_deref()));
     let phase = status.and_then(|s| s.phase.clone());
 
-    let hash_changed = observed_hash != Some(manifest_hash);
-    let force_changed = observed_force != fi.spec.force_rebuild_token.as_deref();
+    let hash_changed = observed_hash != Some(spec_hash);
     let pending_initial = phase.is_none();
+    let retry_failed = matches!(phase, Some(FrontendIntegrationPhase::Failed));
 
-    hash_changed || force_changed || pending_initial
+    hash_changed || pending_initial || retry_failed
 }
 
 async fn sync_status_from_children(
@@ -314,41 +271,40 @@ async fn sync_status_from_children(
     bundle_api: &Api<JSBundle>,
     namespace: &str,
     bundle_name: &str,
-    manifest_hash: &str,
+    spec_hash: &str,
     requeue_seconds: u64,
 ) -> Result<Action, Error> {
     let fi_name = fi.name_any();
-    let current_job = find_job_for_hash(job_api, namespace, &fi_name, manifest_hash).await?;
+    let current_job = find_job_for_hash(job_api, namespace, &fi_name, spec_hash).await?;
 
     if let Some(job) = current_job {
         match observed_job_phase(job.status.as_ref()) {
             ObservedJobPhase::Pending | ObservedJobPhase::Running => {
-                let status =
-                    building_status(fi, manifest_hash, bundle_name, &job, "Build in progress");
+                let status = building_status(fi, spec_hash, bundle_name, &job, "Build in progress");
                 patch_fi_status(fi_api, fi, status).await?;
                 return Ok(Action::requeue(Duration::from_secs(requeue_seconds)));
             }
             ObservedJobPhase::Failed => {
                 let msg =
                     extract_job_message(&job).unwrap_or_else(|| "Build job failed".to_string());
-                let status = failed_status(fi, manifest_hash, msg);
+                let status = failed_status(fi, spec_hash, msg);
                 patch_fi_status(fi_api, fi, status).await?;
                 return Ok(Action::await_change());
             }
             ObservedJobPhase::Succeeded => {
                 let bundle = get_bundle_opt(bundle_api, namespace, bundle_name).await?;
                 if let Some(bundle) = bundle {
-                    if bundle.spec.manifest_hash == manifest_hash {
-                        let status = succeeded_status(fi, manifest_hash, &bundle, &job);
+                    if bundle_matches_spec_hash(&bundle, spec_hash) {
+                        let status = succeeded_status(fi, spec_hash, &bundle, &job);
                         patch_fi_status(fi_api, fi, status).await?;
                         return Ok(Action::await_change());
                     }
                     let status = failed_status(
                         fi,
-                        manifest_hash,
+                        spec_hash,
                         format!(
-                            "Job succeeded but JSBundle {} manifestHash mismatch (expected {}, got {})",
-                            bundle_name, manifest_hash, bundle.spec.manifest_hash
+                            "Job succeeded but JSBundle {} specHash label mismatch (expected {})",
+                            bundle_name, spec_hash
                         ),
                     );
                     patch_fi_status(fi_api, fi, status).await?;
@@ -357,7 +313,7 @@ async fn sync_status_from_children(
 
                 let status = failed_status(
                     fi,
-                    manifest_hash,
+                    spec_hash,
                     format!("Job succeeded but JSBundle {} was not found", bundle_name),
                 );
                 patch_fi_status(fi_api, fi, status).await?;
@@ -367,12 +323,12 @@ async fn sync_status_from_children(
     }
 
     if let Some(bundle) = get_bundle_opt(bundle_api, namespace, bundle_name).await? {
-        if bundle.spec.manifest_hash == manifest_hash {
+        if bundle_matches_spec_hash(&bundle, spec_hash) {
             let status = FrontendIntegrationStatus {
                 phase: Some(FrontendIntegrationPhase::Succeeded),
-                observed_manifest_hash: Some(manifest_hash.to_string()),
+                observed_spec_hash: Some(spec_hash.to_string()),
+                observed_manifest_hash: Some(bundle.spec.manifest_hash.clone()),
                 observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-                observed_force_rebuild_token: fi.spec.force_rebuild_token.clone(),
                 active_build: fi.status.as_ref().and_then(|s| s.active_build.clone()),
                 bundle_ref: Some(resource_ref(&bundle)),
                 message: Some("JSBundle ready".to_string()),
@@ -389,14 +345,14 @@ async fn find_job_for_hash(
     job_api: &Api<Job>,
     namespace: &str,
     fi_name: &str,
-    manifest_hash: &str,
+    spec_hash: &str,
 ) -> Result<Option<Job>, Error> {
     let selector = format!(
         "{}={},{}={}",
         LABEL_FI_NAME,
         fi_name,
-        LABEL_MANIFEST_HASH,
-        manifest_hash_label_value(manifest_hash)
+        LABEL_SPEC_HASH,
+        hash_label_value(spec_hash)
     );
     let jobs = job_api
         .list(&ListParams::default().labels(&selector))
@@ -404,7 +360,7 @@ async fn find_job_for_hash(
         .with_context(|_| ListJobsForHashSnafu {
             namespace: namespace.to_string(),
             fi_name: fi_name.to_string(),
-            manifest_hash: manifest_hash.to_string(),
+            spec_hash: spec_hash.to_string(),
         })?;
     let mut items = jobs.items;
     items.sort_by_key(|j| j.metadata.creation_timestamp.clone());
@@ -456,18 +412,26 @@ fn extract_job_message(job: &Job) -> Option<String> {
     None
 }
 
-fn manifest_hash_label_value(hash: &str) -> String {
+fn hash_label_value(hash: &str) -> String {
     hash.strip_prefix("sha256:").unwrap_or(hash).to_string()
 }
 
-fn labels_for(fi_name: &str, manifest_hash: &str) -> BTreeMap<String, String> {
+fn bundle_matches_spec_hash(bundle: &JSBundle, spec_hash: &str) -> bool {
+    let expected = hash_label_value(spec_hash);
+    bundle
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_SPEC_HASH))
+        .map(|v| v == &expected)
+        .unwrap_or(false)
+}
+
+fn labels_for(fi_name: &str, spec_hash: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string()),
         (LABEL_FI_NAME.to_string(), fi_name.to_string()),
-        (
-            LABEL_MANIFEST_HASH.to_string(),
-            manifest_hash_label_value(manifest_hash),
-        ),
+        (LABEL_SPEC_HASH.to_string(), hash_label_value(spec_hash)),
     ])
 }
 
@@ -482,13 +446,12 @@ fn make_build_job(
     fi: &FrontendIntegration,
     config: &ControllerConfig,
     job_name: &str,
-    secret_name: &str,
     jsbundle_name: &str,
-    manifest_hash: &str,
+    spec_hash: &str,
 ) -> Job {
     let fi_name = fi.name_any();
     let ns = fi.namespace();
-    let mut labels = labels_for(&fi_name, manifest_hash);
+    let mut labels = labels_for(&fi_name, spec_hash);
     labels.insert(LABEL_BUILD_KIND.to_string(), BUILD_KIND_VALUE.to_string());
 
     let mut annotations = BTreeMap::new();
@@ -508,13 +471,8 @@ fn make_build_job(
             ..Default::default()
         },
         EnvVar {
-            name: "MANIFEST_HASH".to_string(),
-            value: Some(manifest_hash.to_string()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: "MANIFEST_PATH".to_string(),
-            value: Some(DEFAULT_MANIFEST_MOUNT_PATH.to_string()),
+            name: "SPEC_HASH".to_string(),
+            value: Some(spec_hash.to_string()),
             ..Default::default()
         },
         EnvVar {
@@ -543,12 +501,6 @@ fn make_build_job(
         name: "runner".to_string(),
         image: Some(config.runner_image.clone()),
         env: Some(env),
-        volume_mounts: Some(vec![VolumeMount {
-            name: "manifest".to_string(),
-            mount_path: "/work/manifest".to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        }]),
         ..Default::default()
     };
 
@@ -575,14 +527,6 @@ fn make_build_job(
                     restart_policy: Some("Never".to_string()),
                     service_account_name: config.runner_service_account.clone(),
                     containers: vec![container],
-                    volumes: Some(vec![Volume {
-                        name: "manifest".to_string(),
-                        secret: Some(SecretVolumeSource {
-                            secret_name: Some(secret_name.to_string()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }]),
                     ..Default::default()
                 }),
             },
@@ -590,35 +534,6 @@ fn make_build_job(
             ..Default::default()
         }),
         status: None,
-    }
-}
-
-fn make_manifest_secret(
-    fi: &FrontendIntegration,
-    job: &Job,
-    secret_name: &str,
-    manifest_hash: &str,
-    manifest_content: &str,
-) -> Secret {
-    let fi_name = fi.name_any();
-    let mut labels = labels_for(&fi_name, manifest_hash);
-    labels.insert(LABEL_BUILD_KIND.to_string(), BUILD_KIND_VALUE.to_string());
-
-    Secret {
-        metadata: ObjectMeta {
-            name: Some(secret_name.to_string()),
-            namespace: fi.namespace(),
-            labels: Some(labels),
-            owner_references: base_owner_ref(job).map(|o| vec![o]),
-            ..Default::default()
-        },
-        immutable: Some(true),
-        string_data: Some(BTreeMap::from([(
-            DEFAULT_MANIFEST_FILENAME.to_string(),
-            manifest_content.to_string(),
-        )])),
-        type_: Some("Opaque".to_string()),
-        ..Default::default()
     }
 }
 
@@ -640,29 +555,6 @@ async fn create_or_get_job(
                 })?)
         }
         Err(err) => Err(Error::CreateJob {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            source: err,
-        }),
-    }
-}
-
-async fn create_or_get_secret(
-    secret_api: &Api<Secret>,
-    namespace: &str,
-    secret: Secret,
-    name: &str,
-) -> Result<Secret, Error> {
-    match secret_api.create(&PostParams::default(), &secret).await {
-        Ok(created) => Ok(created),
-        Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(secret_api
-            .get(name)
-            .await
-            .with_context(|_| GetSecretAfterConflictSnafu {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-            })?),
-        Err(err) => Err(Error::CreateSecret {
             namespace: namespace.to_string(),
             name: name.to_string(),
             source: err,
@@ -694,16 +586,19 @@ fn resource_ref<K: ResourceExt>(obj: &K) -> ResourceRef {
 
 fn building_status(
     fi: &FrontendIntegration,
-    manifest_hash: &str,
+    spec_hash: &str,
     bundle_name: &str,
     job: &Job,
     message: &str,
 ) -> FrontendIntegrationStatus {
     FrontendIntegrationStatus {
         phase: Some(FrontendIntegrationPhase::Building),
-        observed_manifest_hash: Some(manifest_hash.to_string()),
+        observed_spec_hash: Some(spec_hash.to_string()),
+        observed_manifest_hash: fi
+            .status
+            .as_ref()
+            .and_then(|s| s.observed_manifest_hash.clone()),
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-        observed_force_rebuild_token: fi.spec.force_rebuild_token.clone(),
         active_build: Some(ActiveBuildStatus {
             job_ref: Some(resource_ref(job)),
             started_at: Some(Utc::now()),
@@ -720,15 +615,15 @@ fn building_status(
 
 fn succeeded_status(
     fi: &FrontendIntegration,
-    manifest_hash: &str,
+    spec_hash: &str,
     bundle: &JSBundle,
     job: &Job,
 ) -> FrontendIntegrationStatus {
     FrontendIntegrationStatus {
         phase: Some(FrontendIntegrationPhase::Succeeded),
-        observed_manifest_hash: Some(manifest_hash.to_string()),
+        observed_spec_hash: Some(spec_hash.to_string()),
+        observed_manifest_hash: Some(bundle.spec.manifest_hash.clone()),
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-        observed_force_rebuild_token: fi.spec.force_rebuild_token.clone(),
         active_build: Some(ActiveBuildStatus {
             job_ref: Some(resource_ref(job)),
             started_at: fi
@@ -745,14 +640,17 @@ fn succeeded_status(
 
 fn failed_status(
     fi: &FrontendIntegration,
-    manifest_hash: &str,
+    spec_hash: &str,
     message: String,
 ) -> FrontendIntegrationStatus {
     FrontendIntegrationStatus {
         phase: Some(FrontendIntegrationPhase::Failed),
-        observed_manifest_hash: Some(manifest_hash.to_string()),
+        observed_spec_hash: Some(spec_hash.to_string()),
+        observed_manifest_hash: fi
+            .status
+            .as_ref()
+            .and_then(|s| s.observed_manifest_hash.clone()),
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-        observed_force_rebuild_token: fi.spec.force_rebuild_token.clone(),
         active_build: fi.status.as_ref().and_then(|s| s.active_build.clone()),
         bundle_ref: fi.status.as_ref().and_then(|s| s.bundle_ref.clone()),
         message: Some(message),
@@ -785,9 +683,11 @@ async fn patch_fi_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frontend_forge_api::FrontendIntegrationSpec;
+    use frontend_forge_api::{
+        FrontendIntegrationSpec, IframeIntegrationSpec, IntegrationSpec, IntegrationType,
+        RoutingSpec,
+    };
     use kube::core::ObjectMeta;
-    use serde_json::json;
 
     fn fi(name: &str, status: Option<FrontendIntegrationStatus>) -> FrontendIntegration {
         FrontendIntegration {
@@ -798,10 +698,22 @@ mod tests {
                 ..Default::default()
             },
             spec: FrontendIntegrationSpec {
-                source: json!({"foo": "bar"}),
-                bundle_name: None,
-                force_rebuild_token: None,
-                paused: None,
+                display_name: None,
+                enabled: Some(true),
+                integration: IntegrationSpec {
+                    type_: IntegrationType::Iframe,
+                    crd: None,
+                    iframe: Some(IframeIntegrationSpec {
+                        src: "http://example.test".to_string(),
+                    }),
+                    menu: None,
+                },
+                routing: RoutingSpec {
+                    path: "demo".to_string(),
+                },
+                columns: vec![],
+                menu: None,
+                builder: None,
             },
             status,
         }
@@ -812,7 +724,7 @@ mod tests {
         let fi = fi(
             "demo",
             Some(FrontendIntegrationStatus {
-                observed_manifest_hash: Some("sha256:old".to_string()),
+                observed_spec_hash: Some("sha256:old".to_string()),
                 phase: Some(FrontendIntegrationPhase::Succeeded),
                 ..Default::default()
             }),
@@ -823,7 +735,7 @@ mod tests {
 
     #[test]
     fn hash_label_value_is_dns_safe() {
-        assert_eq!(manifest_hash_label_value("sha256:abcd"), "abcd");
-        assert_eq!(manifest_hash_label_value("abcd"), "abcd");
+        assert_eq!(hash_label_value("sha256:abcd"), "abcd");
+        assert_eq!(hash_label_value("abcd"), "abcd");
     }
 }

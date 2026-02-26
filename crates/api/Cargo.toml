@@ -11,6 +11,7 @@ kube.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+snafu.workspace = true
 
 [dev-dependencies]
 serde_yaml.workspace = true

@@ -1,8 +1,12 @@
+mod manifest;
+
 use frontend_forge_api::{
-    FrontendIntegration, JSBundle, JsBundleFile, JsBundleFileEncoding, JsBundleSpec, JsBundleStatus,
+    FrontendIntegration, JSBundle, JsBundleFile, JsBundleFileEncoding, JsBundleSpec,
+    JsBundleStatus, ManifestRenderError,
 };
 use frontend_forge_common::{
-    ANNO_BUILD_JOB, LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, MANAGED_BY_VALUE,
+    ANNO_BUILD_JOB, CommonError, LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH,
+    LABEL_SPEC_HASH, MANAGED_BY_VALUE, manifest_content_and_hash, serializable_hash,
 };
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, Resource};
@@ -11,7 +15,6 @@ use snafu::{ResultExt, Snafu};
 use std::collections::BTreeMap;
 use std::env;
 use std::time::{Duration, Instant};
-use tokio::fs;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -41,11 +44,12 @@ enum Error {
         name: String,
         source: kube::Error,
     },
-    #[snafu(display("failed to read manifest file {path}: {source}"))]
-    ReadManifestFile {
-        path: String,
-        source: std::io::Error,
-    },
+    #[snafu(display("failed to render ExtensionManifest from FrontendIntegration: {source}"))]
+    RenderManifest { source: ManifestRenderError },
+    #[snafu(display("failed to canonicalize/hash runner manifest: {source}"))]
+    ManifestHash { source: CommonError },
+    #[snafu(display("failed to canonicalize/hash FrontendIntegration spec: {source}"))]
+    SpecHash { source: CommonError },
     #[snafu(display(
         "failed to initialize build-service HTTP client (timeout={timeout_seconds}s): {source}"
     ))]
@@ -73,7 +77,7 @@ enum Error {
     },
     #[snafu(display("build-service returned failure: {message}"))]
     BuildFailed { message: String },
-    #[snafu(display("fi status.observedManifestHash not available within grace period"))]
+    #[snafu(display("fi status.observed_spec_hash not available within grace period"))]
     StaleCheckTimeout,
 }
 
@@ -81,8 +85,7 @@ enum Error {
 struct RunnerConfig {
     fi_namespace: String,
     fi_name: String,
-    manifest_hash: String,
-    manifest_path: String,
+    spec_hash: String,
     jsbundle_name: String,
     build_service_base_url: String,
     build_service_timeout_seconds: u64,
@@ -95,9 +98,7 @@ impl RunnerConfig {
         Ok(Self {
             fi_namespace: required_env("FI_NAMESPACE")?,
             fi_name: required_env("FI_NAME")?,
-            manifest_hash: required_env("MANIFEST_HASH")?,
-            manifest_path: env::var("MANIFEST_PATH")
-                .unwrap_or_else(|_| "/work/manifest/manifest.json".to_string()),
+            spec_hash: required_env_alias("SPEC_HASH", "MANIFEST_HASH")?,
             jsbundle_name: required_env("JSBUNDLE_NAME")?,
             build_service_base_url: required_env("BUILD_SERVICE_BASE_URL")?,
             build_service_timeout_seconds: parse_env_u64("BUILD_SERVICE_TIMEOUT_SECONDS", 600)?,
@@ -109,6 +110,13 @@ impl RunnerConfig {
 
 fn required_env(key: &'static str) -> Result<String, Error> {
     env::var(key).context(MissingEnvSnafu { key })
+}
+
+fn required_env_alias(primary: &'static str, legacy: &'static str) -> Result<String, Error> {
+    match env::var(primary) {
+        Ok(v) => Ok(v),
+        Err(_) => required_env(legacy),
+    }
 }
 
 fn parse_env_u64(key: &'static str, default: u64) -> Result<u64, Error> {
@@ -200,11 +208,12 @@ impl BuildServiceClient {
     async fn create_build(
         &self,
         cfg: &RunnerConfig,
+        manifest_hash: &str,
         manifest: &str,
     ) -> Result<CreateBuildResponse, Error> {
         let url = format!("{}/v1/builds", self.base_url);
         let req = CreateBuildRequest {
-            manifest_hash: cfg.manifest_hash.clone(),
+            manifest_hash: manifest_hash.to_string(),
             manifest: manifest.to_string(),
             context: BuildContext {
                 namespace: cfg.fi_namespace.clone(),
@@ -321,22 +330,46 @@ async fn main() -> Result<(), Error> {
 
 async fn run() -> Result<(), Error> {
     let cfg = RunnerConfig::from_env()?;
-    let manifest = fs::read_to_string(&cfg.manifest_path)
-        .await
-        .with_context(|_| ReadManifestFileSnafu {
-            path: cfg.manifest_path.clone(),
-        })?;
-    let build_client = BuildServiceClient::new(&cfg)?;
     let kube = Client::try_default().await.context(KubeClientInitSnafu)?;
+    let fi_api = Api::<FrontendIntegration>::namespaced(kube.clone(), &cfg.fi_namespace);
+    let fi_for_build =
+        fi_api
+            .get(&cfg.fi_name)
+            .await
+            .with_context(|_| GetFrontendIntegrationSnafu {
+                namespace: cfg.fi_namespace.clone(),
+                name: cfg.fi_name.clone(),
+            })?;
+    let computed_spec_hash = serializable_hash(&fi_for_build.spec).context(SpecHashSnafu)?;
+    if computed_spec_hash != cfg.spec_hash {
+        warn!(
+            fi = %cfg.fi_name,
+            expected_spec_hash = %cfg.spec_hash,
+            actual_spec_hash = %computed_spec_hash,
+            "runner observed newer/different FI spec before build; skipping stale job"
+        );
+        return Ok(());
+    }
+    let manifest_value =
+        manifest::render_extension_manifest(&fi_for_build).context(RenderManifestSnafu)?;
+    let (manifest, manifest_hash) =
+        manifest_content_and_hash(&manifest_value).context(ManifestHashSnafu)?;
 
-    info!(fi = %cfg.fi_name, hash = %cfg.manifest_hash, "starting build runner");
-    let create = build_client.create_build(&cfg, &manifest).await?;
+    let build_client = BuildServiceClient::new(&cfg)?;
+
+    info!(
+        fi = %cfg.fi_name,
+        spec_hash = %cfg.spec_hash,
+        manifest_hash = %manifest_hash,
+        "starting build runner"
+    );
+    let create = build_client
+        .create_build(&cfg, &manifest_hash, &manifest)
+        .await?;
     info!(build_id = %create.build_id, status = ?create.status, "build created");
     build_client.wait_for_completion(&create.build_id).await?;
     let files = build_client.fetch_files(&create.build_id).await?;
     info!(build_id = %create.build_id, files = files.len(), "build artifacts fetched");
-
-    let fi_api = Api::<FrontendIntegration>::namespaced(kube.clone(), &cfg.fi_namespace);
     let fi = stale_check(&fi_api, &cfg).await?;
     if fi.is_none() {
         warn!("build became stale; exiting without writing JSBundle");
@@ -345,7 +378,7 @@ async fn run() -> Result<(), Error> {
     let fi = fi.expect("checked above");
 
     let bundle_api = Api::<JSBundle>::namespaced(kube, &cfg.fi_namespace);
-    upsert_jsbundle(&bundle_api, &cfg, &fi, files).await?;
+    upsert_jsbundle(&bundle_api, &cfg, &fi, &manifest_hash, files).await?;
     info!(bundle = %cfg.jsbundle_name, "jsbundle upserted");
     Ok(())
 }
@@ -367,10 +400,15 @@ async fn stale_check(
         let observed = fi
             .status
             .as_ref()
-            .and_then(|s| s.observed_manifest_hash.as_deref());
+            .and_then(|s| s.observed_spec_hash.as_deref())
+            .or_else(|| {
+                fi.status
+                    .as_ref()
+                    .and_then(|s| s.observed_manifest_hash.as_deref())
+            });
 
         match observed {
-            Some(hash) if hash == cfg.manifest_hash => return Ok(Some(fi)),
+            Some(hash) if hash == cfg.spec_hash => return Ok(Some(fi)),
             Some(_) => return Ok(None),
             None if Instant::now() < deadline => {
                 sleep(Duration::from_secs(2)).await;
@@ -384,6 +422,7 @@ async fn upsert_jsbundle(
     bundle_api: &Api<JSBundle>,
     cfg: &RunnerConfig,
     fi: &FrontendIntegration,
+    manifest_hash: &str,
     remote_files: Vec<RemoteFile>,
 ) -> Result<(), Error> {
     let owner_ref = fi.controller_owner_ref(&());
@@ -396,10 +435,17 @@ async fn upsert_jsbundle(
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
     labels.insert(
-        LABEL_MANIFEST_HASH.to_string(),
-        cfg.manifest_hash
+        LABEL_SPEC_HASH.to_string(),
+        cfg.spec_hash
             .strip_prefix("sha256:")
-            .unwrap_or(&cfg.manifest_hash)
+            .unwrap_or(&cfg.spec_hash)
+            .to_string(),
+    );
+    labels.insert(
+        LABEL_MANIFEST_HASH.to_string(),
+        manifest_hash
+            .strip_prefix("sha256:")
+            .unwrap_or(manifest_hash)
             .to_string(),
     );
 
@@ -416,7 +462,7 @@ async fn upsert_jsbundle(
             ..Default::default()
         },
         spec: JsBundleSpec {
-            manifest_hash: cfg.manifest_hash.clone(),
+            manifest_hash: manifest_hash.to_string(),
             files,
         },
         status: Some(JsBundleStatus {

@@ -21,18 +21,188 @@ spec:
         properties:
           spec:
             properties:
-              bundle_name:
+              builder:
+                nullable: true
+                properties:
+                  engineVersion:
+                    nullable: true
+                    type: string
+                type: object
+              columns:
+                items:
+                  properties:
+                    enableHiding:
+                      nullable: true
+                      type: boolean
+                    enableSorting:
+                      nullable: true
+                      type: boolean
+                    key:
+                      type: string
+                    render:
+                      properties:
+                        format:
+                          nullable: true
+                          type: string
+                        link:
+                          nullable: true
+                          type: string
+                        path:
+                          type: string
+                        pattern:
+                          nullable: true
+                          type: string
+                        payload:
+                          nullable: true
+                        type:
+                          enum:
+                          - text
+                          - time
+                          - link
+                          type: string
+                      required:
+                      - path
+                      - type
+                      type: object
+                    title:
+                      type: string
+                  required:
+                  - key
+                  - render
+                  - title
+                  type: object
+                type: array
+              displayName:
                 nullable: true
                 type: string
-              force_rebuild_token:
-                nullable: true
-                type: string
-              paused:
+              enabled:
                 nullable: true
                 type: boolean
-              source: {}
+              integration:
+                properties:
+                  crd:
+                    nullable: true
+                    properties:
+                      authKey:
+                        nullable: true
+                        type: string
+                      columns:
+                        items:
+                          properties:
+                            enableHiding:
+                              nullable: true
+                              type: boolean
+                            enableSorting:
+                              nullable: true
+                              type: boolean
+                            key:
+                              type: string
+                            render:
+                              properties:
+                                format:
+                                  nullable: true
+                                  type: string
+                                link:
+                                  nullable: true
+                                  type: string
+                                path:
+                                  type: string
+                                pattern:
+                                  nullable: true
+                                  type: string
+                                payload:
+                                  nullable: true
+                                type:
+                                  enum:
+                                  - text
+                                  - time
+                                  - link
+                                  type: string
+                              required:
+                              - path
+                              - type
+                              type: object
+                            title:
+                              type: string
+                          required:
+                          - key
+                          - render
+                          - title
+                          type: object
+                        type: array
+                      group:
+                        type: string
+                      names:
+                        properties:
+                          kind:
+                            type: string
+                          plural:
+                            type: string
+                        required:
+                        - kind
+                        - plural
+                        type: object
+                      scope:
+                        enum:
+                        - Namespaced
+                        - Cluster
+                        type: string
+                      version:
+                        type: string
+                    required:
+                    - group
+                    - names
+                    - scope
+                    - version
+                    type: object
+                  iframe:
+                    nullable: true
+                    properties:
+                      src:
+                        type: string
+                    required:
+                    - src
+                    type: object
+                  menu:
+                    nullable: true
+                    properties:
+                      name:
+                        nullable: true
+                        type: string
+                    type: object
+                  type:
+                    enum:
+                    - crd
+                    - iframe
+                    type: string
+                required:
+                - type
+                type: object
+              menu:
+                nullable: true
+                properties:
+                  name:
+                    nullable: true
+                    type: string
+                  placements:
+                    items:
+                      enum:
+                      - global
+                      - workspace
+                      - cluster
+                      type: string
+                    type: array
+                type: object
+              routing:
+                properties:
+                  path:
+                    type: string
+                required:
+                - path
+                type: object
             required:
-            - source
+            - integration
+            - routing
             type: object
           status:
             nullable: true
@@ -102,14 +272,14 @@ spec:
               message:
                 nullable: true
                 type: string
-              observed_force_rebuild_token:
-                nullable: true
-                type: string
               observed_generation:
                 format: int64
                 nullable: true
                 type: integer
               observed_manifest_hash:
+                nullable: true
+                type: string
+              observed_spec_hash:
                 nullable: true
                 type: string
               phase:
