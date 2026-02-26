@@ -104,7 +104,7 @@ enum Error {
 
 #[derive(Clone, Debug)]
 struct RunnerConfig {
-    fi_namespace: String,
+    work_namespace: String,
     fi_name: String,
     spec_hash: String,
     jsbundle_name: String,
@@ -119,7 +119,8 @@ struct RunnerConfig {
 impl RunnerConfig {
     fn from_env() -> Result<Self, Error> {
         Ok(Self {
-            fi_namespace: required_env("FI_NAMESPACE")?,
+            work_namespace: env::var("WORK_NAMESPACE")
+                .unwrap_or_else(|_| "extension-frontend-forge".to_string()),
             fi_name: required_env("FI_NAME")?,
             spec_hash: required_env_alias("SPEC_HASH", "MANIFEST_HASH")?,
             jsbundle_name: required_env("JSBUNDLE_NAME")?,
@@ -246,7 +247,7 @@ impl BuildServiceClient {
             manifest_hash: manifest_hash.to_string(),
             manifest: manifest.to_string(),
             context: BuildContext {
-                namespace: cfg.fi_namespace.clone(),
+                namespace: cfg.work_namespace.clone(),
                 frontend_integration: cfg.fi_name.clone(),
             },
         };
@@ -361,13 +362,13 @@ async fn main() -> Result<(), Error> {
 async fn run() -> Result<(), Error> {
     let cfg = RunnerConfig::from_env()?;
     let kube = Client::try_default().await.context(KubeClientInitSnafu)?;
-    let fi_api = Api::<FrontendIntegration>::namespaced(kube.clone(), &cfg.fi_namespace);
+    let fi_api = Api::<FrontendIntegration>::all(kube.clone());
     let fi_for_build =
         fi_api
             .get(&cfg.fi_name)
             .await
             .with_context(|_| GetFrontendIntegrationSnafu {
-                namespace: cfg.fi_namespace.clone(),
+                namespace: "<cluster>".to_string(),
                 name: cfg.fi_name.clone(),
             })?;
     let computed_spec_hash = serializable_hash(&fi_for_build.spec).context(SpecHashSnafu)?;
@@ -446,7 +447,7 @@ async fn stale_check(
             .get(&cfg.fi_name)
             .await
             .with_context(|_| GetFrontendIntegrationSnafu {
-                namespace: cfg.fi_namespace.clone(),
+                namespace: "<cluster>".to_string(),
                 name: cfg.fi_name.clone(),
             })?;
         let observed = fi
@@ -479,11 +480,7 @@ async fn upsert_bundle_configmap(
     bundle_content: &str,
     manifest_hash: &str,
 ) -> Result<(), Error> {
-    let owner_refs = if cfg.jsbundle_configmap_namespace == cfg.fi_namespace {
-        fi.controller_owner_ref(&()).map(|o| vec![o])
-    } else {
-        None
-    };
+    let owner_refs = fi.controller_owner_ref(&()).map(|o| vec![o]);
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());

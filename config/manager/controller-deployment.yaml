@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: frontend-forge-system
+  name: extension-frontend-forge
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend-forge-controller
-  namespace: frontend-forge-system
+  namespace: extension-frontend-forge
 spec:
   replicas: 1
   selector:
@@ -28,8 +28,12 @@ spec:
               value: ghcr.io/example/frontend-forge-runner:latest
             - name: RUNNER_SERVICE_ACCOUNT
               value: frontend-forge-runner
+            - name: WORK_NAMESPACE
+              value: extension-frontend-forge
             - name: BUILD_SERVICE_BASE_URL
-              value: http://build-service.default.svc.cluster.local
+              value: http://build-service.extension-frontend-forge.svc.cluster.local
+            - name: JSBUNDLE_CONFIGMAP_NAMESPACE
+              value: extension-frontend-forge
             - name: BUILD_SERVICE_TIMEOUT_SECONDS
               value: "600"
             - name: STALE_CHECK_GRACE_SECONDS

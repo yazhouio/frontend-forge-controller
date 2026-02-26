@@ -2,7 +2,6 @@ apiVersion: frontend-forge.io/v1alpha1
 kind: FrontendIntegration
 metadata:
   name: demo-fi
-  namespace: default
   annotations:
     kubesphere.io/description: Demo iframe integration
 spec:

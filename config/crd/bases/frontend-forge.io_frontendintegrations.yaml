@@ -11,7 +11,7 @@ spec:
     shortNames:
     - fi
     singular: frontendintegration
-  scope: Namespaced
+  scope: Cluster
   versions:
   - additionalPrinterColumns: []
     name: v1alpha1
@@ -299,3 +299,4 @@ spec:
     storage: true
     subresources:
       status: {}
+

@@ -17,7 +17,6 @@ pub const JSBUNDLE_API_VERSION: &str = "v1alpha1";
     version = "v1alpha1",
     kind = "FrontendIntegration",
     plural = "frontendintegrations",
-    namespaced,
     status = "FrontendIntegrationStatus",
     shortname = "fi"
 )]

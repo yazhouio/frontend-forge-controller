@@ -2,31 +2,29 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: frontend-forge-runner
-  namespace: default
+  namespace: extension-frontend-forge
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: frontend-forge-runner-fi-reader
-  namespace: default
 rules:
   - apiGroups: ["frontend-forge.io"]
     resources: ["frontendintegrations"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: frontend-forge-runner-fi-reader
-  namespace: default
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: frontend-forge-runner-fi-reader
 subjects:
   - kind: ServiceAccount
     name: frontend-forge-runner
-    namespace: default
+    namespace: extension-frontend-forge
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -50,7 +48,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: frontend-forge-runner
-    namespace: default
+    namespace: extension-frontend-forge
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -72,4 +70,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: frontend-forge-runner
-    namespace: default
+    namespace: extension-frontend-forge

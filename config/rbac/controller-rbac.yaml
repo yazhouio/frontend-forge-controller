@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: frontend-forge-controller
-  namespace: frontend-forge-system
+  namespace: extension-frontend-forge
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -36,4 +36,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: frontend-forge-controller
-    namespace: frontend-forge-system
+    namespace: extension-frontend-forge

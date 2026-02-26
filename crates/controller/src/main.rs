@@ -6,7 +6,7 @@ use frontend_forge_api::{
 use frontend_forge_common::{
     ANNO_MANIFEST_HASH, ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, LABEL_BUILD_KIND,
     LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE,
-    default_cluster_bundle_name, job_name, serializable_hash, time_nonce,
+    default_bundle_name, job_name, serializable_hash, time_nonce,
 };
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::JobStatus;
@@ -29,8 +29,6 @@ use tracing::{error, info, warn};
 enum Error {
     #[snafu(display("spec/hash error: {source}"))]
     Common { source: CommonError },
-    #[snafu(display("missing namespace for FrontendIntegration {name}"))]
-    MissingNamespace { name: String },
     #[snafu(display("failed to initialize Kubernetes client: {source}"))]
     KubeClientInit { source: kube::Error },
     #[snafu(display("failed to patch FrontendIntegration status {namespace}/{name}: {source}"))]
@@ -70,6 +68,7 @@ enum Error {
 
 #[derive(Clone, Debug)]
 struct ControllerConfig {
+    work_namespace: String,
     runner_image: String,
     runner_service_account: Option<String>,
     build_service_base_url: String,
@@ -84,11 +83,14 @@ struct ControllerConfig {
 impl ControllerConfig {
     fn from_env() -> Self {
         Self {
+            work_namespace: env::var("WORK_NAMESPACE")
+                .unwrap_or_else(|_| "extension-frontend-forge".to_string()),
             runner_image: env::var("RUNNER_IMAGE")
                 .unwrap_or_else(|_| "ghcr.io/example/frontend-forge-runner:latest".to_string()),
             runner_service_account: env::var("RUNNER_SERVICE_ACCOUNT").ok(),
-            build_service_base_url: env::var("BUILD_SERVICE_BASE_URL")
-                .unwrap_or_else(|_| "http://build-service.default.svc.cluster.local".to_string()),
+            build_service_base_url: env::var("BUILD_SERVICE_BASE_URL").unwrap_or_else(|_| {
+                "http://build-service.extension-frontend-forge.svc.cluster.local".to_string()
+            }),
             jsbundle_configmap_namespace: env::var("JSBUNDLE_CONFIGMAP_NAMESPACE")
                 .unwrap_or_else(|_| "extension-frontend-forge".to_string()),
             jsbundle_config_key: env::var("JSBUNDLE_CONFIG_KEY")
@@ -164,13 +166,11 @@ fn error_policy(_fi: Arc<FrontendIntegration>, err: &Error, _ctx: Arc<ContextDat
 
 async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Result<Action, Error> {
     let fi_name = fi.name_any();
-    let ns = fi.namespace().ok_or_else(|| Error::MissingNamespace {
-        name: fi_name.clone(),
-    })?;
     let client = ctx.client.clone();
+    let work_ns = ctx.config.work_namespace.clone();
 
-    let fi_api = Api::<FrontendIntegration>::namespaced(client.clone(), &ns);
-    let job_api = Api::<Job>::namespaced(client.clone(), &ns);
+    let fi_api = Api::<FrontendIntegration>::all(client.clone());
+    let job_api = Api::<Job>::namespaced(client.clone(), &work_ns);
     let bundle_api = Api::<JSBundle>::all(client.clone());
 
     if fi.meta().deletion_timestamp.is_some() {
@@ -204,11 +204,12 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
 
     let spec_hash = serializable_hash(&fi.spec).context(CommonSnafu)?;
 
-    let desired_bundle_name = default_cluster_bundle_name(&ns, &fi_name);
+    let desired_bundle_name = default_bundle_name(&fi_name);
 
     let needs_build = needs_new_build(&fi, &spec_hash);
     if needs_build {
-        let running_or_pending = find_job_for_hash(&job_api, &ns, &fi_name, &spec_hash).await?;
+        let running_or_pending =
+            find_job_for_hash(&job_api, &work_ns, &fi_name, &spec_hash).await?;
         let chosen_job = if let Some(job) = running_or_pending {
             job
         } else {
@@ -221,7 +222,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
                 &desired_bundle_name,
                 &spec_hash,
             );
-            let created_job = create_or_get_job(&job_api, &ns, desired_job, &job_name).await?;
+            let created_job = create_or_get_job(&job_api, &work_ns, desired_job, &job_name).await?;
             created_job
         };
 
@@ -243,7 +244,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
         &fi_api,
         &job_api,
         &bundle_api,
-        &ns,
+        &work_ns,
         &desired_bundle_name,
         &spec_hash,
         ctx.config.reconcile_requeue_seconds,
@@ -454,7 +455,6 @@ fn make_build_job(
     spec_hash: &str,
 ) -> Job {
     let fi_name = fi.name_any();
-    let ns = fi.namespace();
     let mut labels = labels_for(&fi_name, spec_hash);
     labels.insert(LABEL_BUILD_KIND.to_string(), BUILD_KIND_VALUE.to_string());
 
@@ -464,11 +464,6 @@ fn make_build_job(
     }
 
     let env = vec![
-        EnvVar {
-            name: "FI_NAMESPACE".to_string(),
-            value: ns,
-            ..Default::default()
-        },
         EnvVar {
             name: "FI_NAME".to_string(),
             value: Some(fi_name.clone()),
@@ -487,6 +482,11 @@ fn make_build_job(
         EnvVar {
             name: "BUILD_SERVICE_BASE_URL".to_string(),
             value: Some(config.build_service_base_url.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "WORK_NAMESPACE".to_string(),
+            value: Some(config.work_namespace.clone()),
             ..Default::default()
         },
         EnvVar {
@@ -521,7 +521,7 @@ fn make_build_job(
     Job {
         metadata: ObjectMeta {
             name: Some(job_name.to_string()),
-            namespace: fi.namespace(),
+            namespace: Some(config.work_namespace.clone()),
             labels: Some(labels),
             annotations: Some(annotations),
             owner_references: base_owner_ref(fi).map(|o| vec![o]),
