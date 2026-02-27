@@ -25,7 +25,7 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - name: RUNNER_IMAGE
-              value: ghcr.io/example/frontend-forge-runner:latest
+              value: spike2044/frontend-forge-runner:latest
             - name: RUNNER_SERVICE_ACCOUNT
               value: frontend-forge-runner
             - name: BUILD_SERVICE_BASE_URL

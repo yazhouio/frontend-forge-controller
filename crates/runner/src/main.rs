@@ -2,7 +2,7 @@ mod manifest;
 
 use frontend_forge_api::{
     FrontendIntegration, JSBundle, JsBundleNamespacedKeyRef, JsBundleRawFromSpec, JsBundleSpec,
-    ManifestRenderError,
+    JsBundleStatus, ManifestRenderError,
 };
 use frontend_forge_common::{
     ANNO_BUILD_JOB, ANNO_MANIFEST_HASH, CommonError, LABEL_FI_NAME, LABEL_MANAGED_BY,
@@ -12,6 +12,7 @@ use frontend_forge_common::{
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, Resource};
+use serde_json::json;
 use serde::Deserialize;
 use snafu::{ResultExt, Snafu};
 use std::collections::BTreeMap;
@@ -48,6 +49,12 @@ enum Error {
     },
     #[snafu(display("failed to upsert JSBundle {namespace}/{name}: {source}"))]
     UpsertJsBundle {
+        namespace: String,
+        name: String,
+        source: kube::Error,
+    },
+    #[snafu(display("failed to patch JSBundle status {namespace}/{name}: {source}"))]
+    PatchJsBundleStatus {
         namespace: String,
         name: String,
         source: kube::Error,
@@ -174,7 +181,7 @@ impl BuildServiceClient {
     }
 
     async fn build_project(&self, manifest: &str) -> Result<Vec<RemoteFile>, Error> {
-        let url = format!("{}/project/build", self.base_url);
+        let url = format!("{}/api/project/build", self.base_url);
         let resp = self
             .client
             .post(&url)
@@ -435,11 +442,64 @@ async fn upsert_jsbundle(
             name: cfg.jsbundle_name.clone(),
         })?;
 
+    let desired_status = JsBundleStatus {
+        state: Some("Available".to_string()),
+        link: Some(bundle_link(&cfg.jsbundle_name, bundle_key)),
+        conditions: vec![],
+    };
+    patch_jsbundle_status(bundle_api, cfg, &desired_status).await?;
+
     Ok(())
 }
 
 fn bundle_configmap_name(jsbundle_name: &str) -> String {
     bounded_name(&format!("{}-config", jsbundle_name), 63)
+}
+
+fn bundle_link(jsbundle_name: &str, bundle_key: &str) -> String {
+    format!(
+        "/dist/{}/{}",
+        jsbundle_name,
+        bundle_key.trim_start_matches('/')
+    )
+}
+
+async fn patch_jsbundle_status(
+    bundle_api: &Api<JSBundle>,
+    cfg: &RunnerConfig,
+    status: &JsBundleStatus,
+) -> Result<(), Error> {
+    let status_patch = json!({ "status": status });
+    match bundle_api
+        .patch_status(
+            &cfg.jsbundle_name,
+            &PatchParams::default(),
+            &Patch::Merge(&status_patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        // Some clusters expose JSBundle without status subresource.
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            bundle_api
+                .patch(
+                    &cfg.jsbundle_name,
+                    &PatchParams::default(),
+                    &Patch::Merge(&status_patch),
+                )
+                .await
+                .with_context(|_| PatchJsBundleStatusSnafu {
+                    namespace: "<cluster>".to_string(),
+                    name: cfg.jsbundle_name.clone(),
+                })?;
+            Ok(())
+        }
+        Err(err) => Err(Error::PatchJsBundleStatus {
+            namespace: "<cluster>".to_string(),
+            name: cfg.jsbundle_name.clone(),
+            source: err,
+        }),
+    }
 }
 
 fn select_bundle_artifact(
@@ -527,5 +587,13 @@ mod tests {
 
         assert_eq!(key, "index.js");
         assert_eq!(content, "console.log('js')");
+    }
+
+    #[test]
+    fn builds_jsbundle_link() {
+        assert_eq!(
+            bundle_link("fi-demo", "index.js"),
+            "/dist/fi-demo/index.js"
+        );
     }
 }

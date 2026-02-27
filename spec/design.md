@@ -109,7 +109,7 @@
 
 用途：
 
-- build-service `POST /project/build` 请求体（Manifest JSON）对应的追溯 hash（runner 本地计算）
+- build-service `POST /api/project/build` 请求体（Manifest JSON）对应的追溯 hash（runner 本地计算）
 - `JSBundle` metadata label/annotation `frontend-forge.io/manifest-hash`
 - `FI.status.observed_manifest_hash`（在成功态由 controller 从 bundle metadata 回写）
 
@@ -218,7 +218,7 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 3. 按 `spec.builder.engineVersion` 将 FI 转换成 Manifest
 4. 计算 `manifest_hash`
 5. 调用 build-service：
-   - `POST /project/build`（请求体即 Manifest JSON）
+   - `POST /api/project/build`（请求体即 Manifest JSON）
    - 响应 `{ ok, files }`
 6. 执行 stale-check（对齐 `FI.status.observed_spec_hash`）
 7. 选择入口 JS 产物（默认 key `index.js`）
@@ -270,7 +270,7 @@ Controller 在处理 `Job Succeeded` 时不会仅凭 Job 成功就标记 FI 成�
 
 单请求同步构建：
 
-`POST /project/build`
+`POST /api/project/build`
 
 请求体：
 

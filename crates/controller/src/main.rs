@@ -87,7 +87,7 @@ impl ControllerConfig {
             work_namespace: env::var("WORK_NAMESPACE")
                 .unwrap_or_else(|_| "extension-frontend-forge".to_string()),
             runner_image: env::var("RUNNER_IMAGE")
-                .unwrap_or_else(|_| "ghcr.io/example/frontend-forge-runner:latest".to_string()),
+                .unwrap_or_else(|_| "spike2044/frontend-forge-runner:latest".to_string()),
             runner_service_account: env::var("RUNNER_SERVICE_ACCOUNT").ok(),
             build_service_base_url: env::var("BUILD_SERVICE_BASE_URL").unwrap_or_else(|_| {
                 "http://frontend-forge.extension-frontend-forge.svc".to_string()
@@ -213,9 +213,9 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
 
     let needs_build = needs_new_build(&fi, &spec_hash);
     if needs_build {
-        let running_or_pending =
-            find_job_for_hash(&job_api, &work_ns, &fi_name, &spec_hash).await?;
-        let chosen_job = if let Some(job) = running_or_pending {
+        let existing_job = find_job_for_hash(&job_api, &work_ns, &fi_name, &spec_hash).await?;
+        let chosen_job = if let Some(job) = existing_job.filter(|j| should_reuse_build_job(&fi, j))
+        {
             job
         } else {
             let nonce = time_nonce();
@@ -271,6 +271,19 @@ fn needs_new_build(fi: &FrontendIntegration, spec_hash: &str) -> bool {
     let retry_failed = matches!(phase, Some(FrontendIntegrationPhase::Failed));
 
     hash_changed || pending_initial || retry_failed
+}
+
+fn should_reuse_build_job(fi: &FrontendIntegration, job: &Job) -> bool {
+    match observed_job_phase(job.status.as_ref()) {
+        ObservedJobPhase::Pending | ObservedJobPhase::Running => true,
+        ObservedJobPhase::Succeeded => {
+            !matches!(
+                fi.status.as_ref().and_then(|s| s.phase.clone()),
+                Some(FrontendIntegrationPhase::Failed)
+            )
+        }
+        ObservedJobPhase::Failed => false,
+    }
 }
 
 async fn sync_status_from_children(
@@ -719,6 +732,7 @@ mod tests {
         FrontendIntegrationSpec, IframeIntegrationSpec, IntegrationSpec, IntegrationType,
         RoutingSpec,
     };
+    use k8s_openapi::api::batch::v1::JobStatus;
     use kube::core::ObjectMeta;
 
     fn fi(name: &str, status: Option<FrontendIntegrationStatus>) -> FrontendIntegration {
@@ -769,5 +783,45 @@ mod tests {
     fn hash_label_value_is_dns_safe() {
         assert_eq!(hash_label_value("sha256:abcd"), "abcd");
         assert_eq!(hash_label_value("abcd"), "abcd");
+    }
+
+    fn job_with_status(active: Option<i32>, succeeded: Option<i32>, failed: Option<i32>) -> Job {
+        Job {
+            status: Some(JobStatus {
+                active,
+                succeeded,
+                failed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn does_not_reuse_failed_job_when_retrying_failed_phase() {
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                phase: Some(FrontendIntegrationPhase::Failed),
+                ..Default::default()
+            }),
+        );
+        let failed_job = job_with_status(None, None, Some(1));
+
+        assert!(!should_reuse_build_job(&fi, &failed_job));
+    }
+
+    #[test]
+    fn reuses_running_job_when_retrying_failed_phase() {
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                phase: Some(FrontendIntegrationPhase::Failed),
+                ..Default::default()
+            }),
+        );
+        let running_job = job_with_status(Some(1), None, None);
+
+        assert!(should_reuse_build_job(&fi, &running_job));
     }
 }

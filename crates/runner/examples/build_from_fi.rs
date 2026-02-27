@@ -48,7 +48,7 @@ async fn main() -> Result<(), DynError> {
     let manifest_path = args.output_dir.join("manifest.json");
     fs::write(&manifest_path, &manifest_content)?;
 
-    let request_url = format!("{}/project/build", args.base_url.trim_end_matches('/'));
+    let request_url = format!("{}/api/project/build", args.base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.timeout_seconds))
         .build()?;
