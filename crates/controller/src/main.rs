@@ -208,7 +208,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
     let desired_bundle_name = default_bundle_name(&fi_name);
 
     if !fi.spec.enabled() {
-        sync_jsbundle_enabled_if_exists(&bundle_api, &desired_bundle_name, false).await?;
+        sync_jsbundle_enabled_if_exists(&bundle_api, &fi, &desired_bundle_name, false).await?;
         patch_fi_status(
             &fi_api,
             &fi,
@@ -336,7 +336,7 @@ async fn sync_status_from_children(
                 let bundle = get_bundle_opt(bundle_api, bundle_name).await?;
                 if let Some(bundle) = bundle {
                     if bundle_matches_spec_hash(&bundle, spec_hash) {
-                        sync_jsbundle_enabled_state(bundle_api, &bundle, true).await?;
+                        sync_jsbundle_enabled_state(bundle_api, fi, &bundle, true).await?;
                         let status = succeeded_status(fi, spec_hash, &bundle, &job);
                         patch_fi_status(fi_api, fi, status).await?;
                         return Ok(Action::await_change());
@@ -367,7 +367,7 @@ async fn sync_status_from_children(
 
     if let Some(bundle) = get_bundle_opt(bundle_api, bundle_name).await? {
         if bundle_matches_spec_hash(&bundle, spec_hash) {
-            sync_jsbundle_enabled_state(bundle_api, &bundle, true).await?;
+            sync_jsbundle_enabled_state(bundle_api, fi, &bundle, true).await?;
             let status = FrontendIntegrationStatus {
                 phase: Some(FrontendIntegrationPhase::Succeeded),
                 observed_spec_hash: Some(spec_hash.to_string()),
@@ -657,21 +657,24 @@ async fn patch_fi_enabled_label_if_needed(
 
 async fn sync_jsbundle_enabled_if_exists(
     bundle_api: &Api<JSBundle>,
+    fi: &FrontendIntegration,
     bundle_name: &str,
     enabled: bool,
 ) -> Result<(), Error> {
     let bundle = get_bundle_opt(bundle_api, bundle_name).await?;
     if let Some(bundle) = bundle {
-        sync_jsbundle_enabled_state(bundle_api, &bundle, enabled).await?;
+        sync_jsbundle_enabled_state(bundle_api, fi, &bundle, enabled).await?;
     }
     Ok(())
 }
 
 async fn sync_jsbundle_enabled_state(
     bundle_api: &Api<JSBundle>,
+    fi: &FrontendIntegration,
     bundle: &JSBundle,
     enabled: bool,
 ) -> Result<(), Error> {
+    patch_jsbundle_owner_ref_if_needed(bundle_api, fi, bundle).await?;
     patch_jsbundle_enabled_label_if_needed(bundle_api, bundle, enabled).await?;
     let desired_state = if enabled {
         JSBUNDLE_STATE_AVAILABLE
@@ -680,6 +683,45 @@ async fn sync_jsbundle_enabled_state(
     };
     patch_jsbundle_state_if_needed(bundle_api, bundle, desired_state).await?;
     Ok(())
+}
+
+async fn patch_jsbundle_owner_ref_if_needed(
+    bundle_api: &Api<JSBundle>,
+    fi: &FrontendIntegration,
+    bundle: &JSBundle,
+) -> Result<(), Error> {
+    let Some(owner_ref) = base_owner_ref(fi) else {
+        return Ok(());
+    };
+
+    let mut owners = bundle
+        .metadata
+        .owner_references
+        .clone()
+        .unwrap_or_default();
+    if owners.iter().any(|owner| owner.uid == owner_ref.uid) {
+        return Ok(());
+    }
+    owners.push(owner_ref);
+
+    let name = bundle.name_any();
+    let patch = json!({
+        "metadata": {
+            "ownerReferences": owners,
+        }
+    });
+    match bundle_api
+        .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+        Err(source) => Err(Error::PatchJsBundle {
+            namespace: "<cluster>".to_string(),
+            name,
+            source,
+        }),
+    }
 }
 
 async fn patch_jsbundle_enabled_label_if_needed(

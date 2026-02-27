@@ -10,6 +10,7 @@ use frontend_forge_common::{
     hash_label_value, manifest_content_and_hash, serializable_hash,
 };
 use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, Resource};
 use serde::Deserialize;
@@ -303,10 +304,10 @@ async fn run() -> Result<(), Error> {
     upsert_jsbundle(
         &bundle_api,
         &cfg,
+        &fi,
         &configmap_name,
         &bundle_key,
         &manifest_hash,
-        fi.spec.enabled(),
     )
     .await?;
     info!(bundle = %cfg.jsbundle_name, "jsbundle upserted");
@@ -357,7 +358,6 @@ async fn upsert_bundle_configmap(
     bundle_content: &str,
     manifest_hash: &str,
 ) -> Result<(), Error> {
-    let owner_refs = fi.controller_owner_ref(&()).map(|o| vec![o]);
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
@@ -378,7 +378,7 @@ async fn upsert_bundle_configmap(
         metadata: kube::core::ObjectMeta {
             name: Some(configmap_name.to_string()),
             namespace: Some(cfg.jsbundle_configmap_namespace.clone()),
-            owner_references: owner_refs,
+            owner_references: owner_refs_for(fi),
             labels: Some(labels),
             annotations: Some(annotations),
             ..Default::default()
@@ -408,17 +408,17 @@ async fn upsert_bundle_configmap(
 async fn upsert_jsbundle(
     bundle_api: &Api<JSBundle>,
     cfg: &RunnerConfig,
+    fi: &FrontendIntegration,
     configmap_name: &str,
     bundle_key: &str,
     manifest_hash: &str,
-    enabled: bool,
 ) -> Result<(), Error> {
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
     labels.insert(
         LABEL_ENABLED.to_string(),
-        enabled_label_value(enabled).to_string(),
+        enabled_label_value(fi.spec.enabled()).to_string(),
     );
     labels.insert(
         LABEL_SPEC_HASH.to_string(),
@@ -436,6 +436,7 @@ async fn upsert_jsbundle(
     let bundle = JSBundle {
         metadata: kube::core::ObjectMeta {
             name: Some(cfg.jsbundle_name.clone()),
+            owner_references: owner_refs_for(fi),
             labels: Some(labels),
             annotations: Some(annotations),
             ..Default::default()
@@ -476,6 +477,13 @@ async fn upsert_jsbundle(
     patch_jsbundle_status(bundle_api, cfg, &desired_status).await?;
 
     Ok(())
+}
+
+fn owner_refs_for<T>(obj: &T) -> Option<Vec<OwnerReference>>
+where
+    T: Resource<DynamicType = ()>,
+{
+    obj.controller_owner_ref(&()).map(|owner| vec![owner])
 }
 
 fn bundle_configmap_name(jsbundle_name: &str) -> String {
@@ -577,6 +585,34 @@ mod tests {
     };
     use kube::core::ObjectMeta;
 
+    fn test_fi(name: &str) -> FrontendIntegration {
+        FrontendIntegration {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: FrontendIntegrationSpec {
+                display_name: None,
+                enabled: Some(true),
+                integration: IntegrationSpec {
+                    type_: IntegrationType::Iframe,
+                    crd: None,
+                    iframe: Some(IframeIntegrationSpec {
+                        src: "http://example.test".to_string(),
+                    }),
+                    menu: None,
+                },
+                routing: RoutingSpec {
+                    path: name.to_string(),
+                },
+                columns: vec![],
+                menu: None,
+                builder: None,
+            },
+            status: None,
+        }
+    }
+
     #[test]
     fn decodes_plain_file_passthrough() {
         let file = RemoteFile {
@@ -627,31 +663,7 @@ mod tests {
 
     #[test]
     fn build_spec_hash_ignores_enabled() {
-        let fi_enabled = FrontendIntegration {
-            metadata: ObjectMeta {
-                name: Some("demo".to_string()),
-                ..Default::default()
-            },
-            spec: FrontendIntegrationSpec {
-                display_name: None,
-                enabled: Some(true),
-                integration: IntegrationSpec {
-                    type_: IntegrationType::Iframe,
-                    crd: None,
-                    iframe: Some(IframeIntegrationSpec {
-                        src: "http://example.test".to_string(),
-                    }),
-                    menu: None,
-                },
-                routing: RoutingSpec {
-                    path: "demo".to_string(),
-                },
-                columns: vec![],
-                menu: None,
-                builder: None,
-            },
-            status: None,
-        };
+        let fi_enabled = test_fi("demo");
         let mut fi_disabled = fi_enabled.clone();
         fi_disabled.spec.enabled = Some(false);
 
@@ -664,5 +676,21 @@ mod tests {
     fn enabled_label_is_boolean_string() {
         assert_eq!(enabled_label_value(true), "true");
         assert_eq!(enabled_label_value(false), "false");
+    }
+
+    #[test]
+    fn owner_refs_for_fi_sets_controller_owner_reference() {
+        let mut fi = test_fi("demo");
+        fi.metadata.uid = Some("fi-uid-123".to_string());
+
+        let owner_refs = owner_refs_for(&fi).expect("owner refs");
+        assert_eq!(owner_refs.len(), 1);
+
+        let owner = &owner_refs[0];
+        assert_eq!(owner.api_version, "frontend-forge.io/v1alpha1");
+        assert_eq!(owner.kind, "FrontendIntegration");
+        assert_eq!(owner.name, "demo");
+        assert_eq!(owner.uid, "fi-uid-123");
+        assert_eq!(owner.controller, Some(true));
     }
 }
