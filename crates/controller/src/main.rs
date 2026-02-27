@@ -77,6 +77,7 @@ struct ControllerConfig {
     build_service_timeout_seconds: u64,
     stale_check_grace_seconds: u64,
     reconcile_requeue_seconds: u64,
+    job_active_deadline_seconds: i64,
     job_ttl_seconds_after_finished: Option<i32>,
 }
 
@@ -107,6 +108,10 @@ impl ControllerConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
+            job_active_deadline_seconds: env::var("JOB_ACTIVE_DEADLINE_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90),
             job_ttl_seconds_after_finished: env::var("JOB_TTL_SECONDS_AFTER_FINISHED")
                 .ok()
                 .and_then(|v| v.parse().ok()),
@@ -519,6 +524,7 @@ fn make_build_job(
             ..Default::default()
         },
         spec: Some(JobSpec {
+            active_deadline_seconds: Some(config.job_active_deadline_seconds),
             ttl_seconds_after_finished: config.job_ttl_seconds_after_finished,
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
