@@ -1,3 +1,4 @@
+#[path = "manifest/v1.rs"]
 mod v1;
 
 use frontend_forge_api::{FrontendIntegration, ManifestRenderError};
