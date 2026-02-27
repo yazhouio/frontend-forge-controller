@@ -318,6 +318,12 @@ impl FrontendIntegrationSpec {
         self.enabled.unwrap_or(true)
     }
 
+    pub fn without_enabled(&self) -> Self {
+        let mut spec = self.clone();
+        spec.enabled = None;
+        spec
+    }
+
     pub fn engine_version(&self) -> Option<&str> {
         self.builder
             .as_ref()

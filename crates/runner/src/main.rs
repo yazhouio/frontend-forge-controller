@@ -5,15 +5,15 @@ use frontend_forge_api::{
     JsBundleStatus, ManifestRenderError,
 };
 use frontend_forge_common::{
-    ANNO_BUILD_JOB, ANNO_MANIFEST_HASH, CommonError, LABEL_FI_NAME, LABEL_MANAGED_BY,
-    LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE, bounded_name, hash_label_value,
-    manifest_content_and_hash, serializable_hash,
+    ANNO_BUILD_JOB, ANNO_MANIFEST_HASH, CommonError, LABEL_ENABLED, LABEL_FI_NAME,
+    LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE, bounded_name,
+    hash_label_value, manifest_content_and_hash, serializable_hash,
 };
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::api::{Patch, PatchParams};
 use kube::{Api, Client, Resource};
-use serde_json::json;
 use serde::Deserialize;
+use serde_json::json;
 use snafu::{ResultExt, Snafu};
 use std::collections::BTreeMap;
 use std::env;
@@ -145,6 +145,14 @@ fn parse_env_u64(key: &'static str, default: u64) -> Result<u64, Error> {
     }
 }
 
+fn enabled_label_value(enabled: bool) -> &'static str {
+    if enabled { "true" } else { "false" }
+}
+
+fn build_spec_hash(fi: &FrontendIntegration) -> Result<String, CommonError> {
+    serializable_hash(&fi.spec.without_enabled())
+}
+
 #[derive(Clone)]
 struct BuildServiceClient {
     base_url: String,
@@ -244,12 +252,12 @@ async fn run() -> Result<(), Error> {
                 namespace: "<cluster>".to_string(),
                 name: cfg.fi_name.clone(),
             })?;
-    let computed_spec_hash = serializable_hash(&fi_for_build.spec).context(SpecHashSnafu)?;
-    if computed_spec_hash != cfg.spec_hash {
+    let build_spec_hash = build_spec_hash(&fi_for_build).context(SpecHashSnafu)?;
+    if cfg.spec_hash != build_spec_hash {
         warn!(
             fi = %cfg.fi_name,
             expected_spec_hash = %cfg.spec_hash,
-            actual_spec_hash = %computed_spec_hash,
+            actual_build_hash = %build_spec_hash,
             "runner observed newer/different FI spec before build; skipping stale job"
         );
         return Ok(());
@@ -298,6 +306,7 @@ async fn run() -> Result<(), Error> {
         &configmap_name,
         &bundle_key,
         &manifest_hash,
+        fi.spec.enabled(),
     )
     .await?;
     info!(bundle = %cfg.jsbundle_name, "jsbundle upserted");
@@ -352,8 +361,14 @@ async fn upsert_bundle_configmap(
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
-    labels.insert(LABEL_SPEC_HASH.to_string(), hash_label_value(&cfg.spec_hash));
-    labels.insert(LABEL_MANIFEST_HASH.to_string(), hash_label_value(manifest_hash));
+    labels.insert(
+        LABEL_SPEC_HASH.to_string(),
+        hash_label_value(&cfg.spec_hash),
+    );
+    labels.insert(
+        LABEL_MANIFEST_HASH.to_string(),
+        hash_label_value(manifest_hash),
+    );
 
     let mut annotations = BTreeMap::new();
     annotations.insert(ANNO_BUILD_JOB.to_string(), job_name_from_env());
@@ -396,12 +411,23 @@ async fn upsert_jsbundle(
     configmap_name: &str,
     bundle_key: &str,
     manifest_hash: &str,
+    enabled: bool,
 ) -> Result<(), Error> {
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
-    labels.insert(LABEL_SPEC_HASH.to_string(), hash_label_value(&cfg.spec_hash));
-    labels.insert(LABEL_MANIFEST_HASH.to_string(), hash_label_value(manifest_hash));
+    labels.insert(
+        LABEL_ENABLED.to_string(),
+        enabled_label_value(enabled).to_string(),
+    );
+    labels.insert(
+        LABEL_SPEC_HASH.to_string(),
+        hash_label_value(&cfg.spec_hash),
+    );
+    labels.insert(
+        LABEL_MANIFEST_HASH.to_string(),
+        hash_label_value(manifest_hash),
+    );
 
     let mut annotations = BTreeMap::new();
     annotations.insert(ANNO_BUILD_JOB.to_string(), job_name_from_env());
@@ -545,6 +571,11 @@ fn job_name_from_env() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frontend_forge_api::{
+        FrontendIntegrationSpec, IframeIntegrationSpec, IntegrationSpec, IntegrationType,
+        RoutingSpec,
+    };
+    use kube::core::ObjectMeta;
 
     #[test]
     fn decodes_plain_file_passthrough() {
@@ -591,9 +622,47 @@ mod tests {
 
     #[test]
     fn builds_jsbundle_link() {
-        assert_eq!(
-            bundle_link("fi-demo", "index.js"),
-            "/dist/fi-demo/index.js"
-        );
+        assert_eq!(bundle_link("fi-demo", "index.js"), "/dist/fi-demo/index.js");
+    }
+
+    #[test]
+    fn build_spec_hash_ignores_enabled() {
+        let fi_enabled = FrontendIntegration {
+            metadata: ObjectMeta {
+                name: Some("demo".to_string()),
+                ..Default::default()
+            },
+            spec: FrontendIntegrationSpec {
+                display_name: None,
+                enabled: Some(true),
+                integration: IntegrationSpec {
+                    type_: IntegrationType::Iframe,
+                    crd: None,
+                    iframe: Some(IframeIntegrationSpec {
+                        src: "http://example.test".to_string(),
+                    }),
+                    menu: None,
+                },
+                routing: RoutingSpec {
+                    path: "demo".to_string(),
+                },
+                columns: vec![],
+                menu: None,
+                builder: None,
+            },
+            status: None,
+        };
+        let mut fi_disabled = fi_enabled.clone();
+        fi_disabled.spec.enabled = Some(false);
+
+        let enabled_hash = build_spec_hash(&fi_enabled).expect("hash");
+        let disabled_hash = build_spec_hash(&fi_disabled).expect("hash");
+        assert_eq!(enabled_hash, disabled_hash);
+    }
+
+    #[test]
+    fn enabled_label_is_boolean_string() {
+        assert_eq!(enabled_label_value(true), "true");
+        assert_eq!(enabled_label_value(false), "false");
     }
 }

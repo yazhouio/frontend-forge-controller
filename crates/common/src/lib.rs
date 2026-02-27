@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MANAGED_BY_VALUE: &str = "frontend-forge-builder-controller";
 pub const LABEL_MANAGED_BY: &str = "frontend-forge.io/managed-by";
 pub const LABEL_FI_NAME: &str = "frontend-forge.io/fi-name";
+pub const LABEL_ENABLED: &str = "frontend-forge.io/enabled";
 pub const LABEL_SPEC_HASH: &str = "frontend-forge.io/spec-hash";
 pub const LABEL_MANIFEST_HASH: &str = "frontend-forge.io/manifest-hash";
 pub const LABEL_BUILD_KIND: &str = "frontend-forge.io/build-kind";

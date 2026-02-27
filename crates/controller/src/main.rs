@@ -5,8 +5,9 @@ use frontend_forge_api::{
 };
 use frontend_forge_common::{
     ANNO_MANIFEST_HASH, ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, LABEL_BUILD_KIND,
-    LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE,
-    default_bundle_name, hash_label_value, job_name, serializable_hash, time_nonce,
+    LABEL_ENABLED, LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH,
+    MANAGED_BY_VALUE, default_bundle_name, hash_label_value, job_name, serializable_hash,
+    time_nonce,
 };
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::JobStatus;
@@ -37,6 +38,12 @@ enum Error {
         name: String,
         source: kube::Error,
     },
+    #[snafu(display("failed to patch FrontendIntegration metadata {namespace}/{name}: {source}"))]
+    PatchFrontendIntegrationMetadata {
+        namespace: String,
+        name: String,
+        source: kube::Error,
+    },
     #[snafu(display(
         "failed to list Jobs in {namespace} for FrontendIntegration {fi_name} and specHash {spec_hash}: {source}"
     ))]
@@ -48,6 +55,12 @@ enum Error {
     },
     #[snafu(display("failed to get JSBundle {namespace}/{name}: {source}"))]
     GetJsBundle {
+        namespace: String,
+        name: String,
+        source: kube::Error,
+    },
+    #[snafu(display("failed to patch JSBundle {namespace}/{name}: {source}"))]
+    PatchJsBundle {
         namespace: String,
         name: String,
         source: kube::Error,
@@ -133,6 +146,13 @@ enum ObservedJobPhase {
     Failed,
 }
 
+const JSBUNDLE_STATE_AVAILABLE: &str = "Available";
+const JSBUNDLE_STATE_DISABLED: &str = "Disabled";
+
+fn build_spec_hash(fi: &FrontendIntegration) -> Result<String, CommonError> {
+    serializable_hash(&fi.spec.without_enabled())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt()
@@ -182,7 +202,13 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
         return Ok(Action::await_change());
     }
 
+    patch_fi_enabled_label_if_needed(&fi_api, &fi).await?;
+
+    let spec_hash = build_spec_hash(&fi).context(CommonSnafu)?;
+    let desired_bundle_name = default_bundle_name(&fi_name);
+
     if !fi.spec.enabled() {
+        sync_jsbundle_enabled_if_exists(&bundle_api, &desired_bundle_name, false).await?;
         patch_fi_status(
             &fi_api,
             &fi,
@@ -207,10 +233,6 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
         return Ok(Action::await_change());
     }
 
-    let spec_hash = serializable_hash(&fi.spec).context(CommonSnafu)?;
-
-    let desired_bundle_name = default_bundle_name(&fi_name);
-
     let needs_build = needs_new_build(&fi, &spec_hash);
     if needs_build {
         let existing_job = find_job_for_hash(&job_api, &work_ns, &fi_name, &spec_hash).await?;
@@ -227,8 +249,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
                 &desired_bundle_name,
                 &spec_hash,
             );
-            let created_job = create_or_get_job(&job_api, &work_ns, desired_job, &job_name).await?;
-            created_job
+            create_or_get_job(&job_api, &work_ns, desired_job, &job_name).await?
         };
 
         let status = building_status(
@@ -276,12 +297,10 @@ fn needs_new_build(fi: &FrontendIntegration, spec_hash: &str) -> bool {
 fn should_reuse_build_job(fi: &FrontendIntegration, job: &Job) -> bool {
     match observed_job_phase(job.status.as_ref()) {
         ObservedJobPhase::Pending | ObservedJobPhase::Running => true,
-        ObservedJobPhase::Succeeded => {
-            !matches!(
-                fi.status.as_ref().and_then(|s| s.phase.clone()),
-                Some(FrontendIntegrationPhase::Failed)
-            )
-        }
+        ObservedJobPhase::Succeeded => !matches!(
+            fi.status.as_ref().and_then(|s| s.phase.clone()),
+            Some(FrontendIntegrationPhase::Failed)
+        ),
         ObservedJobPhase::Failed => false,
     }
 }
@@ -317,6 +336,7 @@ async fn sync_status_from_children(
                 let bundle = get_bundle_opt(bundle_api, bundle_name).await?;
                 if let Some(bundle) = bundle {
                     if bundle_matches_spec_hash(&bundle, spec_hash) {
+                        sync_jsbundle_enabled_state(bundle_api, &bundle, true).await?;
                         let status = succeeded_status(fi, spec_hash, &bundle, &job);
                         patch_fi_status(fi_api, fi, status).await?;
                         return Ok(Action::await_change());
@@ -347,6 +367,7 @@ async fn sync_status_from_children(
 
     if let Some(bundle) = get_bundle_opt(bundle_api, bundle_name).await? {
         if bundle_matches_spec_hash(&bundle, spec_hash) {
+            sync_jsbundle_enabled_state(bundle_api, &bundle, true).await?;
             let status = FrontendIntegrationStatus {
                 phase: Some(FrontendIntegrationPhase::Succeeded),
                 observed_spec_hash: Some(spec_hash.to_string()),
@@ -596,6 +617,155 @@ async fn get_bundle_opt(bundle_api: &Api<JSBundle>, name: &str) -> Result<Option
         })
 }
 
+fn enabled_label_value(enabled: bool) -> &'static str {
+    if enabled { "true" } else { "false" }
+}
+
+async fn patch_fi_enabled_label_if_needed(
+    fi_api: &Api<FrontendIntegration>,
+    fi: &FrontendIntegration,
+) -> Result<(), Error> {
+    let desired = enabled_label_value(fi.spec.enabled());
+    let current = fi
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_ENABLED))
+        .map(String::as_str);
+    if current == Some(desired) {
+        return Ok(());
+    }
+
+    let fi_name = fi.name_any();
+    let namespace = fi.namespace().unwrap_or_else(|| "<cluster>".to_string());
+    let patch = json!({
+        "metadata": {
+            "labels": {
+                LABEL_ENABLED: desired,
+            }
+        }
+    });
+    fi_api
+        .patch(&fi_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .with_context(|_| PatchFrontendIntegrationMetadataSnafu {
+            namespace,
+            name: fi_name.clone(),
+        })?;
+    Ok(())
+}
+
+async fn sync_jsbundle_enabled_if_exists(
+    bundle_api: &Api<JSBundle>,
+    bundle_name: &str,
+    enabled: bool,
+) -> Result<(), Error> {
+    let bundle = get_bundle_opt(bundle_api, bundle_name).await?;
+    if let Some(bundle) = bundle {
+        sync_jsbundle_enabled_state(bundle_api, &bundle, enabled).await?;
+    }
+    Ok(())
+}
+
+async fn sync_jsbundle_enabled_state(
+    bundle_api: &Api<JSBundle>,
+    bundle: &JSBundle,
+    enabled: bool,
+) -> Result<(), Error> {
+    patch_jsbundle_enabled_label_if_needed(bundle_api, bundle, enabled).await?;
+    let desired_state = if enabled {
+        JSBUNDLE_STATE_AVAILABLE
+    } else {
+        JSBUNDLE_STATE_DISABLED
+    };
+    patch_jsbundle_state_if_needed(bundle_api, bundle, desired_state).await?;
+    Ok(())
+}
+
+async fn patch_jsbundle_enabled_label_if_needed(
+    bundle_api: &Api<JSBundle>,
+    bundle: &JSBundle,
+    enabled: bool,
+) -> Result<(), Error> {
+    let desired = enabled_label_value(enabled);
+    let current = bundle
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(LABEL_ENABLED))
+        .map(String::as_str);
+    if current == Some(desired) {
+        return Ok(());
+    }
+
+    let name = bundle.name_any();
+    let patch = json!({
+        "metadata": {
+            "labels": {
+                LABEL_ENABLED: desired,
+            }
+        }
+    });
+    match bundle_api
+        .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+        Err(source) => Err(Error::PatchJsBundle {
+            namespace: "<cluster>".to_string(),
+            name,
+            source,
+        }),
+    }
+}
+
+async fn patch_jsbundle_state_if_needed(
+    bundle_api: &Api<JSBundle>,
+    bundle: &JSBundle,
+    desired_state: &str,
+) -> Result<(), Error> {
+    let current = bundle
+        .status
+        .as_ref()
+        .and_then(|status| status.state.as_deref());
+    if current == Some(desired_state) {
+        return Ok(());
+    }
+
+    let name = bundle.name_any();
+    let patch = json!({
+        "status": {
+            "state": desired_state,
+        }
+    });
+    match bundle_api
+        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            match bundle_api
+                .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+                Err(source) => Err(Error::PatchJsBundle {
+                    namespace: "<cluster>".to_string(),
+                    name,
+                    source,
+                }),
+            }
+        }
+        Err(source) => Err(Error::PatchJsBundle {
+            namespace: "<cluster>".to_string(),
+            name,
+            source,
+        }),
+    }
+}
+
 fn resource_ref<K: ResourceExt>(obj: &K) -> ResourceRef {
     ResourceRef {
         name: obj.name_any(),
@@ -765,9 +935,24 @@ mod tests {
         }
     }
 
+    fn spec_hash(fi: &FrontendIntegration) -> String {
+        build_spec_hash(fi).expect("spec hash must compute")
+    }
+
+    #[test]
+    fn build_hash_ignores_enabled() {
+        let mut enabled_fi = fi("demo", None);
+        enabled_fi.spec.enabled = Some(true);
+
+        let mut disabled_fi = fi("demo", None);
+        disabled_fi.spec.enabled = Some(false);
+
+        assert_eq!(spec_hash(&enabled_fi), spec_hash(&disabled_fi));
+    }
+
     #[test]
     fn needs_build_when_hash_changes() {
-        let fi = fi(
+        let mut fi = fi(
             "demo",
             Some(FrontendIntegrationStatus {
                 observed_spec_hash: Some("sha256:old".to_string()),
@@ -775,8 +960,22 @@ mod tests {
                 ..Default::default()
             }),
         );
-
+        fi.spec.enabled = Some(true);
         assert!(needs_new_build(&fi, "sha256:new"));
+    }
+
+    #[test]
+    fn does_not_build_when_observed_hash_matches() {
+        let mut fi = fi("demo", None);
+        fi.spec.enabled = Some(true);
+        let hash = spec_hash(&fi);
+        fi.status = Some(FrontendIntegrationStatus {
+            observed_spec_hash: Some(hash.clone()),
+            phase: Some(FrontendIntegrationPhase::Succeeded),
+            ..Default::default()
+        });
+
+        assert!(!needs_new_build(&fi, &hash));
     }
 
     #[test]
@@ -823,5 +1022,29 @@ mod tests {
         let running_job = job_with_status(Some(1), None, None);
 
         assert!(should_reuse_build_job(&fi, &running_job));
+    }
+
+    #[test]
+    fn bundle_hash_match_uses_build_hash_label() {
+        let mut fi = fi("demo", None);
+        fi.spec.enabled = Some(true);
+        let hash = spec_hash(&fi);
+        let bundle = JSBundle {
+            metadata: ObjectMeta {
+                name: Some("fi-demo".to_string()),
+                labels: Some(BTreeMap::from([(
+                    LABEL_SPEC_HASH.to_string(),
+                    hash_label_value(&hash),
+                )])),
+                ..Default::default()
+            },
+            spec: frontend_forge_api::JsBundleSpec {
+                raw: None,
+                raw_from: None,
+            },
+            status: None,
+        };
+
+        assert!(bundle_matches_spec_hash(&bundle, &hash));
     }
 }
