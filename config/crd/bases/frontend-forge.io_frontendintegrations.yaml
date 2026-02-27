@@ -3,7 +3,7 @@ kind: CustomResourceDefinition
 metadata:
   labels:
     kubesphere.io/resource-served: "true"
-  name: frontendintegrations.frontend-forge.io
+  name: frontendintegrations.frontend-forge.kubesphere.io
 spec:
   group: frontend-forge.io
   names:
@@ -56,6 +56,8 @@ spec:
                           type: string
                         payload:
                           nullable: true
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
                         type:
                           enum:
                           - text
@@ -114,6 +116,8 @@ spec:
                                   type: string
                                 payload:
                                   nullable: true
+                                  type: object
+                                  x-kubernetes-preserve-unknown-fields: true
                                 type:
                                   enum:
                                   - text
