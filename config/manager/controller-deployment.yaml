@@ -29,7 +29,7 @@ spec:
             - name: RUNNER_SERVICE_ACCOUNT
               value: frontend-forge-runner
             - name: BUILD_SERVICE_BASE_URL
-              value: http://build-service.extension-frontend-forge.svc.cluster.local
+              value: http://frontend-forge.extension-frontend-forge.svc
             - name: JSBUNDLE_CONFIGMAP_NAMESPACE
               value: extension-frontend-forge
             - name: BUILD_SERVICE_TIMEOUT_SECONDS

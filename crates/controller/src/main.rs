@@ -6,7 +6,7 @@ use frontend_forge_api::{
 use frontend_forge_common::{
     ANNO_MANIFEST_HASH, ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, LABEL_BUILD_KIND,
     LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE,
-    default_bundle_name, job_name, serializable_hash, time_nonce,
+    default_bundle_name, hash_label_value, job_name, serializable_hash, time_nonce,
 };
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::JobStatus;
@@ -89,7 +89,7 @@ impl ControllerConfig {
                 .unwrap_or_else(|_| "ghcr.io/example/frontend-forge-runner:latest".to_string()),
             runner_service_account: env::var("RUNNER_SERVICE_ACCOUNT").ok(),
             build_service_base_url: env::var("BUILD_SERVICE_BASE_URL").unwrap_or_else(|_| {
-                "http://build-service.extension-frontend-forge.svc.cluster.local".to_string()
+                "http://frontend-forge.extension-frontend-forge.svc".to_string()
             }),
             jsbundle_configmap_namespace: env::var("JSBUNDLE_CONFIGMAP_NAMESPACE")
                 .unwrap_or_else(|_| "extension-frontend-forge".to_string()),
@@ -415,10 +415,6 @@ fn extract_job_message(job: &Job) -> Option<String> {
         }
     }
     None
-}
-
-fn hash_label_value(hash: &str) -> String {
-    hash.strip_prefix("sha256:").unwrap_or(hash).to_string()
 }
 
 fn bundle_matches_spec_hash(bundle: &JSBundle, spec_hash: &str) -> bool {

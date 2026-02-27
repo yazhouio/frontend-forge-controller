@@ -6,7 +6,7 @@ use frontend_forge_api::{
 };
 use frontend_forge_common::{
     ANNO_BUILD_JOB, ANNO_MANIFEST_HASH, CommonError, LABEL_FI_NAME, LABEL_MANAGED_BY,
-    LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE, bounded_name,
+    LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE, bounded_name, hash_label_value,
     manifest_content_and_hash, serializable_hash,
 };
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -345,20 +345,8 @@ async fn upsert_bundle_configmap(
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
-    labels.insert(
-        LABEL_SPEC_HASH.to_string(),
-        cfg.spec_hash
-            .strip_prefix("sha256:")
-            .unwrap_or(&cfg.spec_hash)
-            .to_string(),
-    );
-    labels.insert(
-        LABEL_MANIFEST_HASH.to_string(),
-        manifest_hash
-            .strip_prefix("sha256:")
-            .unwrap_or(manifest_hash)
-            .to_string(),
-    );
+    labels.insert(LABEL_SPEC_HASH.to_string(), hash_label_value(&cfg.spec_hash));
+    labels.insert(LABEL_MANIFEST_HASH.to_string(), hash_label_value(manifest_hash));
 
     let mut annotations = BTreeMap::new();
     annotations.insert(ANNO_BUILD_JOB.to_string(), job_name_from_env());
@@ -405,20 +393,8 @@ async fn upsert_jsbundle(
     let mut labels = BTreeMap::new();
     labels.insert(LABEL_MANAGED_BY.to_string(), MANAGED_BY_VALUE.to_string());
     labels.insert(LABEL_FI_NAME.to_string(), cfg.fi_name.clone());
-    labels.insert(
-        LABEL_SPEC_HASH.to_string(),
-        cfg.spec_hash
-            .strip_prefix("sha256:")
-            .unwrap_or(&cfg.spec_hash)
-            .to_string(),
-    );
-    labels.insert(
-        LABEL_MANIFEST_HASH.to_string(),
-        manifest_hash
-            .strip_prefix("sha256:")
-            .unwrap_or(manifest_hash)
-            .to_string(),
-    );
+    labels.insert(LABEL_SPEC_HASH.to_string(), hash_label_value(&cfg.spec_hash));
+    labels.insert(LABEL_MANIFEST_HASH.to_string(), hash_label_value(manifest_hash));
 
     let mut annotations = BTreeMap::new();
     annotations.insert(ANNO_BUILD_JOB.to_string(), job_name_from_env());

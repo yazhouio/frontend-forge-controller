@@ -84,6 +84,14 @@ pub fn hash_short(hash: &str) -> String {
     trimmed.chars().take(8).collect()
 }
 
+pub fn hash_label_value(hash: &str) -> String {
+    let trimmed = hash.strip_prefix("sha256:").unwrap_or(hash);
+    if trimmed.is_empty() {
+        return "0".to_string();
+    }
+    trimmed.chars().take(63).collect()
+}
+
 pub fn default_bundle_name(fi_name: &str) -> String {
     bounded_name(&format!("fi-{}", fi_name), 63)
 }
@@ -206,5 +214,13 @@ mod tests {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             );
         }
+    }
+
+    #[test]
+    fn hash_label_value_is_label_safe() {
+        let hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let v = hash_label_value(hash);
+        assert_eq!(v.len(), 63);
+        assert!(v.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
