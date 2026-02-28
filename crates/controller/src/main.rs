@@ -207,36 +207,21 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
     let spec_hash = build_spec_hash(&fi).context(CommonSnafu)?;
     let desired_bundle_name = default_bundle_name(&fi_name);
 
+    let current_bundle = get_bundle_opt(&bundle_api, &desired_bundle_name).await?;
+
     if !fi.spec.enabled() {
-        sync_jsbundle_enabled_if_exists(&bundle_api, &fi, &desired_bundle_name, false).await?;
-        patch_fi_status(
-            &fi_api,
-            &fi,
-            FrontendIntegrationStatus {
-                phase: Some(FrontendIntegrationPhase::Pending),
-                observed_spec_hash: fi
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.observed_spec_hash.clone()),
-                observed_manifest_hash: fi
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.observed_manifest_hash.clone()),
-                observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-                active_build: fi.status.as_ref().and_then(|s| s.active_build.clone()),
-                bundle_ref: fi.status.as_ref().and_then(|s| s.bundle_ref.clone()),
-                message: Some("Disabled".to_string()),
-                conditions: vec![],
-            },
-        )
-        .await?;
+        if let Some(bundle) = current_bundle.as_ref() {
+            sync_jsbundle_enabled_state(&bundle_api, &fi, bundle, false).await?;
+        }
+        patch_fi_status(&fi_api, &fi, disabled_status(&fi, current_bundle.as_ref())).await?;
         return Ok(Action::await_change());
     }
 
-    let needs_build = needs_new_build(&fi, &spec_hash);
+    let needs_build = needs_new_build(&fi, &spec_hash, current_bundle.as_ref());
     if needs_build {
         let existing_job = find_job_for_hash(&job_api, &work_ns, &fi_name, &spec_hash).await?;
-        let chosen_job = if let Some(job) = existing_job.filter(|j| should_reuse_build_job(&fi, j))
+        let chosen_job = if let Some(job) =
+            existing_job.filter(|j| should_reuse_build_job(&fi, j, current_bundle.as_ref(), &spec_hash))
         {
             job
         } else {
@@ -280,7 +265,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
     Ok(action)
 }
 
-fn needs_new_build(fi: &FrontendIntegration, spec_hash: &str) -> bool {
+fn needs_new_build(fi: &FrontendIntegration, spec_hash: &str, bundle: Option<&JSBundle>) -> bool {
     let status = fi.status.as_ref();
     let observed_hash = status
         .and_then(|s| s.observed_spec_hash.as_deref())
@@ -289,18 +274,36 @@ fn needs_new_build(fi: &FrontendIntegration, spec_hash: &str) -> bool {
 
     let hash_changed = observed_hash != Some(spec_hash);
     let pending_initial = phase.is_none();
-    let retry_failed = matches!(phase, Some(FrontendIntegrationPhase::Failed));
+    let missing_matching_bundle = observed_hash == Some(spec_hash)
+        && !matches!(
+            phase,
+            Some(FrontendIntegrationPhase::Building | FrontendIntegrationPhase::Failed)
+        )
+        && !bundle
+            .map(|bundle| bundle_matches_spec_hash(bundle, spec_hash))
+            .unwrap_or(false);
 
-    hash_changed || pending_initial || retry_failed
+    hash_changed || pending_initial || missing_matching_bundle
 }
 
-fn should_reuse_build_job(fi: &FrontendIntegration, job: &Job) -> bool {
+fn should_reuse_build_job(
+    fi: &FrontendIntegration,
+    job: &Job,
+    bundle: Option<&JSBundle>,
+    spec_hash: &str,
+) -> bool {
     match observed_job_phase(job.status.as_ref()) {
         ObservedJobPhase::Pending | ObservedJobPhase::Running => true,
-        ObservedJobPhase::Succeeded => !matches!(
-            fi.status.as_ref().and_then(|s| s.phase.clone()),
-            Some(FrontendIntegrationPhase::Failed)
-        ),
+        ObservedJobPhase::Succeeded => {
+            let bundle_ready = bundle
+                .map(|bundle| bundle_matches_spec_hash(bundle, spec_hash))
+                .unwrap_or(false);
+            bundle_ready
+                && !matches!(
+                    fi.status.as_ref().and_then(|s| s.phase.clone()),
+                    Some(FrontendIntegrationPhase::Failed)
+                )
+        }
         ObservedJobPhase::Failed => false,
     }
 }
@@ -655,19 +658,6 @@ async fn patch_fi_enabled_label_if_needed(
     Ok(())
 }
 
-async fn sync_jsbundle_enabled_if_exists(
-    bundle_api: &Api<JSBundle>,
-    fi: &FrontendIntegration,
-    bundle_name: &str,
-    enabled: bool,
-) -> Result<(), Error> {
-    let bundle = get_bundle_opt(bundle_api, bundle_name).await?;
-    if let Some(bundle) = bundle {
-        sync_jsbundle_enabled_state(bundle_api, fi, &bundle, enabled).await?;
-    }
-    Ok(())
-}
-
 async fn sync_jsbundle_enabled_state(
     bundle_api: &Api<JSBundle>,
     fi: &FrontendIntegration,
@@ -816,6 +806,28 @@ fn resource_ref<K: ResourceExt>(obj: &K) -> ResourceRef {
     }
 }
 
+fn disabled_status(
+    fi: &FrontendIntegration,
+    bundle: Option<&JSBundle>,
+) -> FrontendIntegrationStatus {
+    FrontendIntegrationStatus {
+        phase: Some(FrontendIntegrationPhase::Pending),
+        observed_spec_hash: fi
+            .status
+            .as_ref()
+            .and_then(|s| s.observed_spec_hash.clone()),
+        observed_manifest_hash: fi
+            .status
+            .as_ref()
+            .and_then(|s| s.observed_manifest_hash.clone()),
+        observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
+        active_build: None,
+        bundle_ref: bundle.map(resource_ref),
+        message: Some("Disabled".to_string()),
+        conditions: vec![],
+    }
+}
+
 fn building_status(
     fi: &FrontendIntegration,
     spec_hash: &str,
@@ -922,9 +934,7 @@ async fn patch_fi_status(
 ) -> Result<(), Error> {
     let fi_name = fi.name_any();
     let namespace = fi.namespace().unwrap_or_else(|| "<cluster>".to_string());
-    let patch = json!({
-        "status": status,
-    });
+    let patch = frontend_integration_status_patch(&status);
 
     fi_api
         .patch_status(&fi_name, &PatchParams::default(), &Patch::Merge(&patch))
@@ -935,6 +945,24 @@ async fn patch_fi_status(
         })?;
 
     Ok(())
+}
+
+fn frontend_integration_status_patch(status: &FrontendIntegrationStatus) -> serde_json::Value {
+    let mut status_value = serde_json::to_value(status).expect("status must serialize");
+    let status_object = status_value
+        .as_object_mut()
+        .expect("status must serialize to object");
+
+    if status.active_build.is_none() {
+        status_object.insert("active_build".to_string(), serde_json::Value::Null);
+    }
+    if status.bundle_ref.is_none() {
+        status_object.insert("bundle_ref".to_string(), serde_json::Value::Null);
+    }
+
+    json!({
+        "status": status_value,
+    })
 }
 
 #[cfg(test)]
@@ -981,6 +1009,24 @@ mod tests {
         build_spec_hash(fi).expect("spec hash must compute")
     }
 
+    fn bundle_for_hash(name: &str, spec_hash: &str) -> JSBundle {
+        JSBundle {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                labels: Some(BTreeMap::from([(
+                    LABEL_SPEC_HASH.to_string(),
+                    hash_label_value(spec_hash),
+                )])),
+                ..Default::default()
+            },
+            spec: frontend_forge_api::JsBundleSpec {
+                raw: None,
+                raw_from: None,
+            },
+            status: None,
+        }
+    }
+
     #[test]
     fn build_hash_ignores_enabled() {
         let mut enabled_fi = fi("demo", None);
@@ -1003,7 +1049,7 @@ mod tests {
             }),
         );
         fi.spec.enabled = Some(true);
-        assert!(needs_new_build(&fi, "sha256:new"));
+        assert!(needs_new_build(&fi, "sha256:new", None));
     }
 
     #[test]
@@ -1011,13 +1057,43 @@ mod tests {
         let mut fi = fi("demo", None);
         fi.spec.enabled = Some(true);
         let hash = spec_hash(&fi);
+        let bundle = bundle_for_hash("fi-demo", &hash);
         fi.status = Some(FrontendIntegrationStatus {
             observed_spec_hash: Some(hash.clone()),
             phase: Some(FrontendIntegrationPhase::Succeeded),
             ..Default::default()
         });
 
-        assert!(!needs_new_build(&fi, &hash));
+        assert!(!needs_new_build(&fi, &hash, Some(&bundle)));
+    }
+
+    #[test]
+    fn does_not_auto_retry_failed_build_when_hash_is_unchanged() {
+        let mut fi = fi("demo", None);
+        fi.spec.enabled = Some(true);
+        let hash = spec_hash(&fi);
+        fi.status = Some(FrontendIntegrationStatus {
+            observed_spec_hash: Some(hash.clone()),
+            phase: Some(FrontendIntegrationPhase::Failed),
+            ..Default::default()
+        });
+
+        assert!(!needs_new_build(&fi, &hash, None));
+    }
+
+    #[test]
+    fn builds_when_matching_bundle_is_missing_after_reenable() {
+        let mut fi = fi("demo", None);
+        fi.spec.enabled = Some(true);
+        let hash = spec_hash(&fi);
+        fi.status = Some(FrontendIntegrationStatus {
+            observed_spec_hash: Some(hash.clone()),
+            phase: Some(FrontendIntegrationPhase::Pending),
+            message: Some("Disabled".to_string()),
+            ..Default::default()
+        });
+
+        assert!(needs_new_build(&fi, &hash, None));
     }
 
     #[test]
@@ -1049,7 +1125,7 @@ mod tests {
         );
         let failed_job = job_with_status(None, None, Some(1));
 
-        assert!(!should_reuse_build_job(&fi, &failed_job));
+        assert!(!should_reuse_build_job(&fi, &failed_job, None, "sha256:demo"));
     }
 
     #[test]
@@ -1063,7 +1139,26 @@ mod tests {
         );
         let running_job = job_with_status(Some(1), None, None);
 
-        assert!(should_reuse_build_job(&fi, &running_job));
+        assert!(should_reuse_build_job(&fi, &running_job, None, "sha256:demo"));
+    }
+
+    #[test]
+    fn does_not_reuse_succeeded_job_when_matching_bundle_is_missing() {
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                phase: Some(FrontendIntegrationPhase::Succeeded),
+                ..Default::default()
+            }),
+        );
+        let succeeded_job = job_with_status(None, Some(1), None);
+
+        assert!(!should_reuse_build_job(
+            &fi,
+            &succeeded_job,
+            None,
+            "sha256:demo",
+        ));
     }
 
     #[test]
@@ -1071,22 +1166,56 @@ mod tests {
         let mut fi = fi("demo", None);
         fi.spec.enabled = Some(true);
         let hash = spec_hash(&fi);
-        let bundle = JSBundle {
-            metadata: ObjectMeta {
-                name: Some("fi-demo".to_string()),
-                labels: Some(BTreeMap::from([(
-                    LABEL_SPEC_HASH.to_string(),
-                    hash_label_value(&hash),
-                )])),
-                ..Default::default()
-            },
-            spec: frontend_forge_api::JsBundleSpec {
-                raw: None,
-                raw_from: None,
-            },
-            status: None,
-        };
+        let bundle = bundle_for_hash("fi-demo", &hash);
 
         assert!(bundle_matches_spec_hash(&bundle, &hash));
+    }
+
+    #[test]
+    fn disabled_status_clears_active_build_and_uses_live_bundle_ref() {
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                observed_spec_hash: Some("sha256:demo".to_string()),
+                observed_manifest_hash: Some("sha256:manifest".to_string()),
+                active_build: Some(ActiveBuildStatus {
+                    job_ref: Some(ResourceRef {
+                        name: "old-job".to_string(),
+                        namespace: Some("default".to_string()),
+                        uid: Some("job-uid".to_string()),
+                    }),
+                    started_at: Some(Utc::now()),
+                }),
+                bundle_ref: Some(ResourceRef {
+                    name: "stale-bundle".to_string(),
+                    namespace: None,
+                    uid: Some("stale-uid".to_string()),
+                }),
+                ..Default::default()
+            }),
+        );
+        let bundle = bundle_for_hash("fi-demo", "sha256:demo");
+        let status = disabled_status(&fi, Some(&bundle));
+
+        assert!(status.active_build.is_none());
+        assert_eq!(
+            status.bundle_ref.map(|bundle_ref| bundle_ref.name),
+            Some("fi-demo".to_string())
+        );
+        assert_eq!(status.message.as_deref(), Some("Disabled"));
+    }
+
+    #[test]
+    fn status_patch_sets_null_for_cleared_optional_refs() {
+        let status = FrontendIntegrationStatus {
+            phase: Some(FrontendIntegrationPhase::Pending),
+            active_build: None,
+            bundle_ref: None,
+            ..Default::default()
+        };
+        let patch = frontend_integration_status_patch(&status);
+
+        assert_eq!(patch["status"]["active_build"], serde_json::Value::Null);
+        assert_eq!(patch["status"]["bundle_ref"], serde_json::Value::Null);
     }
 }
