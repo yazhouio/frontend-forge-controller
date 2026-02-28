@@ -1,0 +1,85 @@
+name: Build And Push Docker Images
+
+on:
+  pull_request_target:
+    branches:
+      - master
+    types:
+      - closed
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+env:
+  DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'spike2044' }}
+
+jobs:
+  build-and-push:
+    if: ${{ github.event_name == 'release' || github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image_name: frontend-forge-controller
+            dockerfile: crates/controller/Dockerfile
+          - image_name: frontend-forge-runner
+            dockerfile: crates/runner/Dockerfile
+
+    steps:
+      - name: Check Out Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Set Up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set Up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log In To Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute Tags
+        id: tags
+        env:
+          IMAGE_NAME: ${{ matrix.image_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          image="docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE_NAME}"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            {
+              echo "tags<<EOF"
+              echo "${image}:${RELEASE_TAG}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          date_tag="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          {
+            echo "tags<<EOF"
+            echo "${image}:${date_tag}"
+            echo "${image}:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build And Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.image_name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image_name }}
