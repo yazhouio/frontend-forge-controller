@@ -44,7 +44,9 @@ enum Error {
         name: String,
         source: kube::Error,
     },
-    #[snafu(display("failed to serialize FrontendIntegration status patch for {namespace}/{name}: {source}"))]
+    #[snafu(display(
+        "failed to serialize FrontendIntegration status patch for {namespace}/{name}: {source}"
+    ))]
     SerializeFrontendIntegrationStatusPatch {
         namespace: String,
         name: String,
@@ -53,10 +55,7 @@ enum Error {
     #[snafu(display(
         "serialized FrontendIntegration status patch for {namespace}/{name} was not a JSON object"
     ))]
-    InvalidFrontendIntegrationStatusPatchShape {
-        namespace: String,
-        name: String,
-    },
+    InvalidFrontendIntegrationStatusPatchShape { namespace: String, name: String },
     #[snafu(display(
         "failed to list Jobs in {namespace} for FrontendIntegration {fi_name} and specHash {spec_hash}: {source}"
     ))]
@@ -233,8 +232,8 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
     let needs_build = needs_new_build(&fi, &spec_hash, current_bundle.as_ref());
     if needs_build {
         let existing_job = find_job_for_hash(&job_api, &work_ns, &fi_name, &spec_hash).await?;
-        let chosen_job = if let Some(job) =
-            existing_job.filter(|j| should_reuse_build_job(&fi, j, current_bundle.as_ref(), &spec_hash))
+        let chosen_job = if let Some(job) = existing_job
+            .filter(|j| should_reuse_build_job(&fi, j, current_bundle.as_ref(), &spec_hash))
         {
             job
         } else {
@@ -697,11 +696,7 @@ async fn patch_jsbundle_owner_ref_if_needed(
         return Ok(());
     };
 
-    let mut owners = bundle
-        .metadata
-        .owner_references
-        .clone()
-        .unwrap_or_default();
+    let mut owners = bundle.metadata.owner_references.clone().unwrap_or_default();
     if owners.iter().any(|owner| owner.uid == owner_ref.uid) {
         return Ok(());
     }
@@ -971,12 +966,12 @@ fn frontend_integration_status_patch(
             name: name.to_string(),
         }
     })?;
-    let status_object = status_value
-        .as_object_mut()
-        .ok_or_else(|| Error::InvalidFrontendIntegrationStatusPatchShape {
+    let status_object = status_value.as_object_mut().ok_or_else(|| {
+        Error::InvalidFrontendIntegrationStatusPatchShape {
             namespace: namespace.to_string(),
             name: name.to_string(),
-        })?;
+        }
+    })?;
 
     if status.active_build.is_none() {
         status_object.insert("active_build".to_string(), serde_json::Value::Null);
@@ -1154,7 +1149,12 @@ mod tests {
         );
         let failed_job = job_with_status(None, None, Some(1));
 
-        assert!(!should_reuse_build_job(&fi, &failed_job, None, "sha256:demo"));
+        assert!(!should_reuse_build_job(
+            &fi,
+            &failed_job,
+            None,
+            "sha256:demo"
+        ));
     }
 
     #[test]
@@ -1168,7 +1168,12 @@ mod tests {
         );
         let running_job = job_with_status(Some(1), None, None);
 
-        assert!(should_reuse_build_job(&fi, &running_job, None, "sha256:demo"));
+        assert!(should_reuse_build_job(
+            &fi,
+            &running_job,
+            None,
+            "sha256:demo"
+        ));
     }
 
     #[test]

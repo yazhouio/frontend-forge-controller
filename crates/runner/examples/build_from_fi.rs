@@ -130,7 +130,7 @@ fn safe_relative_path(raw: &str) -> Result<PathBuf, DynError> {
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(format!("artifact path contains unsafe component: {raw}").into())
+                return Err(format!("artifact path contains unsafe component: {raw}").into());
             }
         }
     }
