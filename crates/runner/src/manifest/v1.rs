@@ -330,3 +330,57 @@ fn render_type_str(t: &ColumnRenderType) -> &'static str {
         ColumnRenderType::Link => "link",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_workspace_crd_pages_with_workspace_page_state() {
+        let fi: FrontendIntegration = serde_yaml::from_str(
+            r#"
+apiVersion: frontend-forge.io/v1alpha1
+kind: FrontendIntegration
+metadata:
+  name: test
+spec:
+  integration:
+    type: crd
+    crd:
+      names:
+        plural: serviceaccounts
+        kind: ServiceAccount
+      version: v1alpha1
+      group: kubesphere.io
+      scope: Namespaced
+      columns:
+        - key: name
+          title: NAME
+          enableSorting: true
+          render:
+            type: text
+            path: metadata.name
+  menu:
+    placements:
+      - cluster
+      - workspace
+  routing:
+    path: test
+"#,
+        )
+        .unwrap();
+
+        let manifest = render_v1_manifest(&fi).unwrap();
+        let pages = manifest["pages"].as_array().unwrap();
+
+        let cluster_page_state = &pages[0]["componentsTree"]["dataSources"][1];
+        assert_eq!(cluster_page_state["type"], "crd-page-state");
+        assert_eq!(cluster_page_state["config"]["PAGE_ID"], "test-cluster");
+        assert_eq!(cluster_page_state["config"]["SCOPE"], "namespace");
+
+        let workspace_page_state = &pages[1]["componentsTree"]["dataSources"][1];
+        assert_eq!(workspace_page_state["type"], "workspace-crd-page-state");
+        assert_eq!(workspace_page_state["config"]["PAGE_ID"], "test-workspace");
+        assert!(workspace_page_state["config"].get("SCOPE").is_none());
+    }
+}
