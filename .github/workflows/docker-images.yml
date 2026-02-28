@@ -3,7 +3,7 @@ name: Build And Push Docker Images
 on:
   pull_request_target:
     branches:
-      - master
+      - main
     types:
       - closed
   release:
