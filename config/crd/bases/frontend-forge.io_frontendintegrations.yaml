@@ -3,7 +3,7 @@ kind: CustomResourceDefinition
 metadata:
   labels:
     kubesphere.io/resource-served: "true"
-  name: frontendintegrations.frontend-forge.kubesphere.io
+  name: frontendintegrations.frontend-forge.io
 spec:
   group: frontend-forge.io
   names:
