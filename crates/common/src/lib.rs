@@ -14,6 +14,7 @@ pub const LABEL_MANIFEST_HASH: &str = "frontend-forge.io/manifest-hash";
 pub const LABEL_BUILD_KIND: &str = "frontend-forge.io/build-kind";
 pub const ANNO_BUILD_JOB: &str = "frontend-forge.io/build-job";
 pub const ANNO_MANIFEST_HASH: &str = "frontend-forge.io/manifest-hash";
+pub const ANNO_MANIFEST_CONTENT: &str = "frontend-forge.io/manifest-content";
 pub const ANNO_OBSERVED_GENERATION: &str = "frontend-forge.io/observed-generation";
 pub const BUILD_KIND_VALUE: &str = "frontend-forge";
 pub const DEFAULT_MANIFEST_FILENAME: &str = "manifest.json";

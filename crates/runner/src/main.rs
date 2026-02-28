@@ -5,9 +5,9 @@ use frontend_forge_api::{
     JsBundleStatus, ManifestRenderError,
 };
 use frontend_forge_common::{
-    ANNO_BUILD_JOB, ANNO_MANIFEST_HASH, CommonError, LABEL_ENABLED, LABEL_FI_NAME,
-    LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE, bounded_name,
-    hash_label_value, manifest_content_and_hash, serializable_hash,
+    ANNO_BUILD_JOB, ANNO_MANIFEST_CONTENT, ANNO_MANIFEST_HASH, CommonError, LABEL_ENABLED,
+    LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE,
+    bounded_name, hash_label_value, manifest_content_and_hash, serializable_hash,
 };
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -306,6 +306,7 @@ async fn run() -> Result<(), Error> {
         &fi,
         &configmap_name,
         &bundle_key,
+        &manifest,
         &manifest_hash,
     )
     .await?;
@@ -410,6 +411,7 @@ async fn upsert_jsbundle(
     fi: &FrontendIntegration,
     configmap_name: &str,
     bundle_key: &str,
+    manifest_content: &str,
     manifest_hash: &str,
 ) -> Result<(), Error> {
     let mut labels = BTreeMap::new();
@@ -428,9 +430,7 @@ async fn upsert_jsbundle(
         hash_label_value(manifest_hash),
     );
 
-    let mut annotations = BTreeMap::new();
-    annotations.insert(ANNO_BUILD_JOB.to_string(), job_name_from_env());
-    annotations.insert(ANNO_MANIFEST_HASH.to_string(), manifest_hash.to_string());
+    let annotations = manifest_annotations(&job_name_from_env(), manifest_content, manifest_hash);
 
     let bundle = JSBundle {
         metadata: kube::core::ObjectMeta {
@@ -476,6 +476,21 @@ async fn upsert_jsbundle(
     patch_jsbundle_status(bundle_api, cfg, &desired_status).await?;
 
     Ok(())
+}
+
+fn manifest_annotations(
+    job_name: &str,
+    manifest_content: &str,
+    manifest_hash: &str,
+) -> BTreeMap<String, String> {
+    let mut annotations = BTreeMap::new();
+    annotations.insert(ANNO_BUILD_JOB.to_string(), job_name.to_string());
+    annotations.insert(ANNO_MANIFEST_HASH.to_string(), manifest_hash.to_string());
+    annotations.insert(
+        ANNO_MANIFEST_CONTENT.to_string(),
+        manifest_content.to_string(),
+    );
+    annotations
 }
 
 fn owner_refs_for<T>(obj: &T) -> Option<Vec<OwnerReference>>
@@ -554,12 +569,13 @@ fn select_bundle_artifact(
             desired_key: desired_key.clone(),
         })?;
 
-    let file = remote_files
-        .into_iter()
-        .nth(selected_idx)
-        .ok_or_else(|| Error::MissingBundleArtifact {
-            desired_key: desired_key.clone(),
-        })?;
+    let file =
+        remote_files
+            .into_iter()
+            .nth(selected_idx)
+            .ok_or_else(|| Error::MissingBundleArtifact {
+                desired_key: desired_key.clone(),
+            })?;
     let content = decode_remote_file_to_utf8(&file)?;
     let key = if file.path.contains('/') {
         desired_key
@@ -660,6 +676,24 @@ mod tests {
     #[test]
     fn builds_jsbundle_link() {
         assert_eq!(bundle_link("fi-demo", "index.js"), "/dist/fi-demo/index.js");
+    }
+
+    #[test]
+    fn manifest_annotations_include_hash_and_content() {
+        let annotations = manifest_annotations("job-1", "{\"kind\":\"Extension\"}", "sha256:abc");
+
+        assert_eq!(
+            annotations.get(ANNO_BUILD_JOB).map(String::as_str),
+            Some("job-1")
+        );
+        assert_eq!(
+            annotations.get(ANNO_MANIFEST_HASH).map(String::as_str),
+            Some("sha256:abc")
+        );
+        assert_eq!(
+            annotations.get(ANNO_MANIFEST_CONTENT).map(String::as_str),
+            Some("{\"kind\":\"Extension\"}")
+        );
     }
 
     #[test]
