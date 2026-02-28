@@ -1,6 +1,6 @@
 use frontend_forge_api::{
-    ColumnRenderType, ColumnSpec, CrdIntegrationSpec, FrontendIntegration, FrontendIntegrationSpec,
-    IntegrationType, ManifestRenderError, MenuPlacement,
+    ColumnRenderType, ColumnSpec, CrdIntegrationSpec, CrdScope, FrontendIntegration,
+    FrontendIntegrationSpec, IntegrationType, ManifestRenderError, MenuPlacement,
 };
 use kube::ResourceExt;
 use serde_json::{Map, Value, json};
@@ -181,8 +181,9 @@ fn crd_page(
     columns: &[ColumnSpec],
 ) -> Value {
     let page_id = page_id(fi_name, placement);
-    let scope_str = placement.as_str();
     let columns_config = transform_columns(columns);
+    let page_state_type = crd_page_state_type(placement);
+    let page_state_config = crd_page_state_config(&page_id, placement, crd);
 
     json!({
       "id": page_id,
@@ -201,22 +202,11 @@ fn crd_page(
           },
           {
             "id": "pageState",
-            "type": "crd-page-state",
+            "type": page_state_type,
             "args": [
               { "type": "binding", "source": "columns", "bind": "columns" }
             ],
-            "config": {
-              "PAGE_ID": page_id,
-              "CRD_CONFIG": {
-                "apiVersion": crd.version,
-                "kind": crd.names.kind,
-                "plural": crd.names.plural,
-                "group": crd.group,
-                "kapi": true
-              },
-              "SCOPE": scope_str,
-              "HOOK_NAME": "useCrdPageState"
-            }
+            "config": page_state_config
           }
         ],
         "root": {
@@ -249,6 +239,44 @@ fn crd_page(
         }
       }
     })
+}
+
+fn crd_page_state_type(placement: MenuPlacement) -> &'static str {
+    match placement {
+        MenuPlacement::Workspace => "workspace-crd-page-state",
+        _ => "crd-page-state",
+    }
+}
+
+fn crd_page_state_config(
+    page_id: &str,
+    placement: MenuPlacement,
+    crd: &CrdIntegrationSpec,
+) -> Value {
+    let mut config = Map::new();
+    config.insert("PAGE_ID".to_string(), json!(page_id));
+    config.insert(
+        "CRD_CONFIG".to_string(),
+        json!({
+          "apiVersion": crd.version,
+          "kind": crd.names.kind,
+          "plural": crd.names.plural,
+          "group": crd.group,
+          "kapi": true
+        }),
+    );
+    if placement != MenuPlacement::Workspace {
+        config.insert("SCOPE".to_string(), json!(crd_page_scope(crd)));
+    }
+    config.insert("HOOK_NAME".to_string(), json!("useCrdPageState"));
+    Value::Object(config)
+}
+
+fn crd_page_scope(crd: &CrdIntegrationSpec) -> &'static str {
+    match crd.scope {
+        CrdScope::Namespaced => "namespace",
+        CrdScope::Cluster => "cluster",
+    }
 }
 
 fn transform_columns(columns: &[ColumnSpec]) -> Vec<Value> {
