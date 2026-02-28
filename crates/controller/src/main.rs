@@ -44,6 +44,19 @@ enum Error {
         name: String,
         source: kube::Error,
     },
+    #[snafu(display("failed to serialize FrontendIntegration status patch for {namespace}/{name}: {source}"))]
+    SerializeFrontendIntegrationStatusPatch {
+        namespace: String,
+        name: String,
+        source: serde_json::Error,
+    },
+    #[snafu(display(
+        "serialized FrontendIntegration status patch for {namespace}/{name} was not a JSON object"
+    ))]
+    InvalidFrontendIntegrationStatusPatchShape {
+        namespace: String,
+        name: String,
+    },
     #[snafu(display(
         "failed to list Jobs in {namespace} for FrontendIntegration {fi_name} and specHash {spec_hash}: {source}"
     ))]
@@ -934,7 +947,7 @@ async fn patch_fi_status(
 ) -> Result<(), Error> {
     let fi_name = fi.name_any();
     let namespace = fi.namespace().unwrap_or_else(|| "<cluster>".to_string());
-    let patch = frontend_integration_status_patch(&status);
+    let patch = frontend_integration_status_patch(&status, &namespace, &fi_name)?;
 
     fi_api
         .patch_status(&fi_name, &PatchParams::default(), &Patch::Merge(&patch))
@@ -947,11 +960,23 @@ async fn patch_fi_status(
     Ok(())
 }
 
-fn frontend_integration_status_patch(status: &FrontendIntegrationStatus) -> serde_json::Value {
-    let mut status_value = serde_json::to_value(status).expect("status must serialize");
+fn frontend_integration_status_patch(
+    status: &FrontendIntegrationStatus,
+    namespace: &str,
+    name: &str,
+) -> Result<serde_json::Value, Error> {
+    let mut status_value = serde_json::to_value(status).with_context(|_| {
+        SerializeFrontendIntegrationStatusPatchSnafu {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+        }
+    })?;
     let status_object = status_value
         .as_object_mut()
-        .expect("status must serialize to object");
+        .ok_or_else(|| Error::InvalidFrontendIntegrationStatusPatchShape {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+        })?;
 
     if status.active_build.is_none() {
         status_object.insert("active_build".to_string(), serde_json::Value::Null);
@@ -960,9 +985,9 @@ fn frontend_integration_status_patch(status: &FrontendIntegrationStatus) -> serd
         status_object.insert("bundle_ref".to_string(), serde_json::Value::Null);
     }
 
-    json!({
+    Ok(json!({
         "status": status_value,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -1005,8 +1030,8 @@ mod tests {
         }
     }
 
-    fn spec_hash(fi: &FrontendIntegration) -> String {
-        build_spec_hash(fi).expect("spec hash must compute")
+    fn spec_hash(fi: &FrontendIntegration) -> Result<String, CommonError> {
+        build_spec_hash(fi)
     }
 
     fn bundle_for_hash(name: &str, spec_hash: &str) -> JSBundle {
@@ -1028,14 +1053,15 @@ mod tests {
     }
 
     #[test]
-    fn build_hash_ignores_enabled() {
+    fn build_hash_ignores_enabled() -> Result<(), CommonError> {
         let mut enabled_fi = fi("demo", None);
         enabled_fi.spec.enabled = Some(true);
 
         let mut disabled_fi = fi("demo", None);
         disabled_fi.spec.enabled = Some(false);
 
-        assert_eq!(spec_hash(&enabled_fi), spec_hash(&disabled_fi));
+        assert_eq!(spec_hash(&enabled_fi)?, spec_hash(&disabled_fi)?);
+        Ok(())
     }
 
     #[test]
@@ -1053,10 +1079,10 @@ mod tests {
     }
 
     #[test]
-    fn does_not_build_when_observed_hash_matches() {
+    fn does_not_build_when_observed_hash_matches() -> Result<(), CommonError> {
         let mut fi = fi("demo", None);
         fi.spec.enabled = Some(true);
-        let hash = spec_hash(&fi);
+        let hash = spec_hash(&fi)?;
         let bundle = bundle_for_hash("fi-demo", &hash);
         fi.status = Some(FrontendIntegrationStatus {
             observed_spec_hash: Some(hash.clone()),
@@ -1065,13 +1091,14 @@ mod tests {
         });
 
         assert!(!needs_new_build(&fi, &hash, Some(&bundle)));
+        Ok(())
     }
 
     #[test]
-    fn does_not_auto_retry_failed_build_when_hash_is_unchanged() {
+    fn does_not_auto_retry_failed_build_when_hash_is_unchanged() -> Result<(), CommonError> {
         let mut fi = fi("demo", None);
         fi.spec.enabled = Some(true);
-        let hash = spec_hash(&fi);
+        let hash = spec_hash(&fi)?;
         fi.status = Some(FrontendIntegrationStatus {
             observed_spec_hash: Some(hash.clone()),
             phase: Some(FrontendIntegrationPhase::Failed),
@@ -1079,13 +1106,14 @@ mod tests {
         });
 
         assert!(!needs_new_build(&fi, &hash, None));
+        Ok(())
     }
 
     #[test]
-    fn builds_when_matching_bundle_is_missing_after_reenable() {
+    fn builds_when_matching_bundle_is_missing_after_reenable() -> Result<(), CommonError> {
         let mut fi = fi("demo", None);
         fi.spec.enabled = Some(true);
-        let hash = spec_hash(&fi);
+        let hash = spec_hash(&fi)?;
         fi.status = Some(FrontendIntegrationStatus {
             observed_spec_hash: Some(hash.clone()),
             phase: Some(FrontendIntegrationPhase::Pending),
@@ -1094,6 +1122,7 @@ mod tests {
         });
 
         assert!(needs_new_build(&fi, &hash, None));
+        Ok(())
     }
 
     #[test]
@@ -1162,13 +1191,14 @@ mod tests {
     }
 
     #[test]
-    fn bundle_hash_match_uses_build_hash_label() {
+    fn bundle_hash_match_uses_build_hash_label() -> Result<(), CommonError> {
         let mut fi = fi("demo", None);
         fi.spec.enabled = Some(true);
-        let hash = spec_hash(&fi);
+        let hash = spec_hash(&fi)?;
         let bundle = bundle_for_hash("fi-demo", &hash);
 
         assert!(bundle_matches_spec_hash(&bundle, &hash));
+        Ok(())
     }
 
     #[test]
@@ -1206,16 +1236,17 @@ mod tests {
     }
 
     #[test]
-    fn status_patch_sets_null_for_cleared_optional_refs() {
+    fn status_patch_sets_null_for_cleared_optional_refs() -> Result<(), Error> {
         let status = FrontendIntegrationStatus {
             phase: Some(FrontendIntegrationPhase::Pending),
             active_build: None,
             bundle_ref: None,
             ..Default::default()
         };
-        let patch = frontend_integration_status_patch(&status);
+        let patch = frontend_integration_status_patch(&status, "default", "demo")?;
 
         assert_eq!(patch["status"]["active_build"], serde_json::Value::Null);
         assert_eq!(patch["status"]["bundle_ref"], serde_json::Value::Null);
+        Ok(())
     }
 }

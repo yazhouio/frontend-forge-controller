@@ -279,11 +279,10 @@ async fn run() -> Result<(), Error> {
     let files = build_client.build_project(&manifest).await?;
     info!(files = files.len(), "build artifacts fetched");
     let fi = stale_check(&fi_api, &cfg).await?;
-    if fi.is_none() {
+    let Some(fi) = fi else {
         warn!("build became stale; exiting without writing JSBundle");
         return Ok(());
-    }
-    let fi = fi.expect("checked above");
+    };
 
     let (bundle_key, bundle_content) = select_bundle_artifact(&cfg, files)?;
     let configmap_name = bundle_configmap_name(&cfg.jsbundle_name);
@@ -558,7 +557,9 @@ fn select_bundle_artifact(
     let file = remote_files
         .into_iter()
         .nth(selected_idx)
-        .expect("selected index must exist");
+        .ok_or_else(|| Error::MissingBundleArtifact {
+            desired_key: desired_key.clone(),
+        })?;
     let content = decode_remote_file_to_utf8(&file)?;
     let key = if file.path.contains('/') {
         desired_key
@@ -662,14 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn build_spec_hash_ignores_enabled() {
+    fn build_spec_hash_ignores_enabled() -> Result<(), CommonError> {
         let fi_enabled = test_fi("demo");
         let mut fi_disabled = fi_enabled.clone();
         fi_disabled.spec.enabled = Some(false);
 
-        let enabled_hash = build_spec_hash(&fi_enabled).expect("hash");
-        let disabled_hash = build_spec_hash(&fi_disabled).expect("hash");
+        let enabled_hash = build_spec_hash(&fi_enabled)?;
+        let disabled_hash = build_spec_hash(&fi_disabled)?;
         assert_eq!(enabled_hash, disabled_hash);
+        Ok(())
     }
 
     #[test]
@@ -679,11 +681,11 @@ mod tests {
     }
 
     #[test]
-    fn owner_refs_for_fi_sets_controller_owner_reference() {
+    fn owner_refs_for_fi_sets_controller_owner_reference() -> Result<(), &'static str> {
         let mut fi = test_fi("demo");
         fi.metadata.uid = Some("fi-uid-123".to_string());
 
-        let owner_refs = owner_refs_for(&fi).expect("owner refs");
+        let owner_refs = owner_refs_for(&fi).ok_or("owner refs missing")?;
         assert_eq!(owner_refs.len(), 1);
 
         let owner = &owner_refs[0];
@@ -692,5 +694,6 @@ mod tests {
         assert_eq!(owner.name, "demo");
         assert_eq!(owner.uid, "fi-uid-123");
         assert_eq!(owner.controller, Some(true));
+        Ok(())
     }
 }
