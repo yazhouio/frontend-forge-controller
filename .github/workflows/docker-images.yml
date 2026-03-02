@@ -152,6 +152,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          {
+            echo "## Multi-platform image digests"
+            echo
+            echo "| Image Tag | Digest |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           for image_name in frontend-forge-controller frontend-forge-runner; do
             repo="docker.io/${DOCKERHUB_NAMESPACE}/${image_name}"
 
@@ -173,5 +180,9 @@ jobs:
                 -t "${t}" \
                 "${repo}@${amd_digest}" \
                 "${repo}@${arm_digest}"
+
+              multiarch_digest="$(docker buildx imagetools inspect "${t}" | sed -n 's/^Digest: //p' | head -n1)"
+              echo "multi-platform image digest: ${t} -> ${multiarch_digest}"
+              echo "| ${t} | \`${multiarch_digest}\` |" >> "$GITHUB_STEP_SUMMARY"
             done
           done
