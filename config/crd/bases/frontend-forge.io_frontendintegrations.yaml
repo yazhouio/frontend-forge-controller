@@ -213,7 +213,7 @@ spec:
           status:
             nullable: true
             properties:
-              active_build:
+              last_build:
                 nullable: true
                 properties:
                   job_ref:

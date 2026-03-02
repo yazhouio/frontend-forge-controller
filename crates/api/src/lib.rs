@@ -218,7 +218,7 @@ pub struct ResourceRef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
-pub struct ActiveBuildStatus {
+pub struct LastBuildStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_ref: Option<ResourceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,8 +251,8 @@ pub struct FrontendIntegrationStatus {
     pub observed_manifest_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_build: Option<ActiveBuildStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "active_build")]
+    pub last_build: Option<LastBuildStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_ref: Option<ResourceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
