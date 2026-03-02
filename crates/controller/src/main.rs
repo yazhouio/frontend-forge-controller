@@ -1,13 +1,12 @@
 use chrono::Utc;
 use frontend_forge_api::{
-    ActiveBuildStatus, FrontendIntegration, FrontendIntegrationPhase, FrontendIntegrationStatus,
+    FrontendIntegration, FrontendIntegrationPhase, FrontendIntegrationStatus, LastBuildStatus,
     JSBundle, ResourceRef,
 };
 use frontend_forge_common::{
     ANNO_MANIFEST_HASH, ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, LABEL_BUILD_KIND,
     LABEL_ENABLED, LABEL_FI_NAME, LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH,
     MANAGED_BY_VALUE, default_bundle_name, hash_label_value, job_name, serializable_hash,
-    time_nonce,
 };
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::JobStatus;
@@ -139,7 +138,8 @@ impl ControllerConfig {
                 .unwrap_or(90),
             job_ttl_seconds_after_finished: env::var("JOB_TTL_SECONDS_AFTER_FINISHED")
                 .ok()
-                .and_then(|v| v.parse().ok()),
+                .and_then(|v| v.parse().ok())
+                .or(Some(DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED)),
         }
     }
 }
@@ -160,6 +160,7 @@ enum ObservedJobPhase {
 
 const JSBUNDLE_STATE_AVAILABLE: &str = "Available";
 const JSBUNDLE_STATE_DISABLED: &str = "Disabled";
+const DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED: i32 = 60 * 60;
 
 fn build_spec_hash(fi: &FrontendIntegration) -> Result<String, CommonError> {
     serializable_hash(&fi.spec.without_enabled())
@@ -184,6 +185,7 @@ async fn main() -> Result<(), Error> {
     let job_api = Api::<Job>::all(client.clone());
     Controller::new(fi_api, watcher::Config::default())
         .owns(job_api, watcher::Config::default())
+        .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .for_each(|result| async move {
             match result {
@@ -192,6 +194,8 @@ async fn main() -> Result<(), Error> {
             }
         })
         .await;
+
+    info!("controller shutdown complete");
 
     Ok(())
 }
@@ -217,6 +221,12 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
     patch_fi_enabled_label_if_needed(&fi_api, &fi).await?;
 
     let spec_hash = build_spec_hash(&fi).context(CommonSnafu)?;
+    info!(
+        fi = %fi_name,
+        spec_hash,
+        phase = ?fi.status.as_ref().and_then(|s| s.phase.as_ref()),
+        "reconcile started"
+    );
     let desired_bundle_name = default_bundle_name(&fi_name);
 
     let current_bundle = get_bundle_opt(&bundle_api, &desired_bundle_name).await?;
@@ -237,8 +247,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
         {
             job
         } else {
-            let nonce = time_nonce();
-            let job_name = job_name(&fi_name, &spec_hash, &nonce);
+            let job_name = job_name(&fi_name, &spec_hash);
             let desired_job = make_build_job(
                 &fi,
                 &ctx.config,
@@ -388,7 +397,7 @@ async fn sync_status_from_children(
                 observed_spec_hash: Some(spec_hash.to_string()),
                 observed_manifest_hash: bundle_manifest_hash(&bundle),
                 observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-                active_build: fi.status.as_ref().and_then(|s| s.active_build.clone()),
+                last_build: fi.status.as_ref().and_then(|s| s.last_build.clone()),
                 bundle_ref: Some(resource_ref(&bundle)),
                 message: Some("JSBundle ready".to_string()),
                 conditions: vec![],
@@ -423,7 +432,18 @@ async fn find_job_for_hash(
         })?;
     let mut items = jobs.items;
     items.sort_by_key(|j| j.metadata.creation_timestamp.clone());
-    Ok(items.pop())
+    let latest_job = items.pop();
+    if items.len() > 0 {
+        if let Some(job) = latest_job.as_ref() {
+            let job_name = job.name_any();
+            warn!(
+                fi = %fi_name,
+                job = %job_name,
+                "multiple jobs found for same spec_hash, using latest"
+            );
+        }
+    }
+    Ok(latest_job)
 }
 
 fn observed_job_phase(status: Option<&JobStatus>) -> ObservedJobPhase {
@@ -829,7 +849,7 @@ fn disabled_status(
             .as_ref()
             .and_then(|s| s.observed_manifest_hash.clone()),
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-        active_build: None,
+        last_build: None,
         bundle_ref: bundle.map(resource_ref),
         message: Some("Disabled".to_string()),
         conditions: vec![],
@@ -851,7 +871,7 @@ fn building_status(
             .as_ref()
             .and_then(|s| s.observed_manifest_hash.clone()),
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-        active_build: Some(ActiveBuildStatus {
+        last_build: Some(LastBuildStatus {
             job_ref: Some(resource_ref(job)),
             started_at: Some(Utc::now()),
         }),
@@ -876,12 +896,12 @@ fn succeeded_status(
         observed_spec_hash: Some(spec_hash.to_string()),
         observed_manifest_hash: bundle_manifest_hash(bundle),
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-        active_build: Some(ActiveBuildStatus {
+        last_build: Some(LastBuildStatus {
             job_ref: Some(resource_ref(job)),
             started_at: fi
                 .status
                 .as_ref()
-                .and_then(|s| s.active_build.clone())
+                .and_then(|s| s.last_build.clone())
                 .and_then(|b| b.started_at),
         }),
         bundle_ref: Some(resource_ref(bundle)),
@@ -928,7 +948,7 @@ fn failed_status(
             .as_ref()
             .and_then(|s| s.observed_manifest_hash.clone()),
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
-        active_build: fi.status.as_ref().and_then(|s| s.active_build.clone()),
+        last_build: fi.status.as_ref().and_then(|s| s.last_build.clone()),
         bundle_ref: fi.status.as_ref().and_then(|s| s.bundle_ref.clone()),
         message: Some(message),
         conditions: vec![],
@@ -973,8 +993,8 @@ fn frontend_integration_status_patch(
         }
     })?;
 
-    if status.active_build.is_none() {
-        status_object.insert("active_build".to_string(), serde_json::Value::Null);
+    if status.last_build.is_none() {
+        status_object.insert("last_build".to_string(), serde_json::Value::Null);
     }
     if status.bundle_ref.is_none() {
         status_object.insert("bundle_ref".to_string(), serde_json::Value::Null);
@@ -1207,13 +1227,13 @@ mod tests {
     }
 
     #[test]
-    fn disabled_status_clears_active_build_and_uses_live_bundle_ref() {
+    fn disabled_status_clears_last_build_and_uses_live_bundle_ref() {
         let fi = fi(
             "demo",
             Some(FrontendIntegrationStatus {
                 observed_spec_hash: Some("sha256:demo".to_string()),
                 observed_manifest_hash: Some("sha256:manifest".to_string()),
-                active_build: Some(ActiveBuildStatus {
+                last_build: Some(LastBuildStatus {
                     job_ref: Some(ResourceRef {
                         name: "old-job".to_string(),
                         namespace: Some("default".to_string()),
@@ -1232,7 +1252,7 @@ mod tests {
         let bundle = bundle_for_hash("fi-demo", "sha256:demo");
         let status = disabled_status(&fi, Some(&bundle));
 
-        assert!(status.active_build.is_none());
+        assert!(status.last_build.is_none());
         assert_eq!(
             status.bundle_ref.map(|bundle_ref| bundle_ref.name),
             Some("fi-demo".to_string())
@@ -1244,13 +1264,13 @@ mod tests {
     fn status_patch_sets_null_for_cleared_optional_refs() -> Result<(), Error> {
         let status = FrontendIntegrationStatus {
             phase: Some(FrontendIntegrationPhase::Pending),
-            active_build: None,
+            last_build: None,
             bundle_ref: None,
             ..Default::default()
         };
         let patch = frontend_integration_status_patch(&status, "default", "demo")?;
 
-        assert_eq!(patch["status"]["active_build"], serde_json::Value::Null);
+        assert_eq!(patch["status"]["last_build"], serde_json::Value::Null);
         assert_eq!(patch["status"]["bundle_ref"], serde_json::Value::Null);
         Ok(())
     }

@@ -81,7 +81,7 @@
 - `status.phase`
 - `status.observed_spec_hash`
 - `status.observed_manifest_hash`（兼容/追溯）
-- `status.active_build.job_ref`
+- `status.last_build.job_ref`
 - `status.bundle_ref`
 - `status.message`
 

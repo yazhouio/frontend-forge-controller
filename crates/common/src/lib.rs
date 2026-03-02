@@ -102,14 +102,9 @@ pub fn default_cluster_bundle_name(fi_namespace: &str, fi_name: &str) -> String 
     bounded_name(&format!("fi-{}-{}", fi_namespace, fi_name), 63)
 }
 
-pub fn job_name(fi_name: &str, manifest_hash: &str, nonce: &str) -> String {
+pub fn job_name(fi_name: &str, manifest_hash: &str) -> String {
     bounded_name(
-        &format!(
-            "fi-{}-build-{}-{}",
-            fi_name,
-            hash_short(manifest_hash),
-            nonce
-        ),
+        &format!("fi-{}-build-{}", fi_name, hash_short(manifest_hash)),
         63,
     )
 }
@@ -203,7 +198,7 @@ mod tests {
     fn generated_names_are_dns_compatible_and_bounded() {
         let fi_name = "My__Very.Long_FrontendIntegration.Name";
         let hash = "sha256:0123456789abcdef";
-        let job = job_name(fi_name, hash, "ab12");
+        let job = job_name(fi_name, hash);
         let secret = secret_name(fi_name, hash, "ab12");
         let bundle = default_bundle_name(fi_name);
 
@@ -216,6 +211,14 @@ mod tests {
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             );
         }
+    }
+
+    #[test]
+    fn job_name_is_deterministic_for_same_hash() {
+        let fi_name = "demo";
+        let hash = "sha256:0123456789abcdef";
+
+        assert_eq!(job_name(fi_name, hash), job_name(fi_name, hash));
     }
 
     #[test]
