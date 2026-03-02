@@ -157,7 +157,7 @@ fn resolve_spec(
                         placement: menu.placement,
                         route_suffix: route_suffix.clone(),
                         menu_name: menu_name_for_suffix(fi_name, &route_suffix),
-                        parent: top_menu_name.clone(),
+                        parent: nested_menu_parent(menu.placement, &top_menu_name),
                         page,
                     });
                 }
@@ -307,6 +307,10 @@ fn route_suffix_for_child(parent_key: &str, child_key: &str) -> String {
 
 fn menu_name_for_suffix(fi_name: &str, suffix: &str) -> String {
     format!("frontendintegrations/{fi_name}/{suffix}")
+}
+
+fn nested_menu_parent(placement: MenuPlacement, menu_name: &str) -> String {
+    format!("{}.{}", placement.as_str(), menu_name)
 }
 
 fn page_id_for_suffix(fi_name: &str, placement: MenuPlacement, suffix: &str) -> String {
@@ -700,12 +704,18 @@ spec:
         assert_eq!(pages.len(), 2);
         assert_eq!(menus[0]["name"], "frontendintegrations/demo-fi/ops");
         assert_eq!(menus[0]["parent"], "workspace");
-        assert_eq!(menus[1]["parent"], "frontendintegrations/demo-fi/ops");
+        assert_eq!(
+            menus[1]["parent"],
+            "workspace.frontendintegrations/demo-fi/ops"
+        );
         assert_eq!(
             menus[1]["name"],
             "frontendintegrations/demo-fi/ops/inspecttasks"
         );
-        assert_eq!(menus[2]["parent"], "frontendintegrations/demo-fi/ops");
+        assert_eq!(
+            menus[2]["parent"],
+            "workspace.frontendintegrations/demo-fi/ops"
+        );
         assert_eq!(
             menus[2]["name"],
             "frontendintegrations/demo-fi/ops/ops-guide"

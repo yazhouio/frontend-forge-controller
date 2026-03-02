@@ -166,6 +166,7 @@ spec:
 - 一级 `organization` 菜单先生成一个分组菜单
 - 一级 `organization` 菜单的 `name` 仍然使用菜单生成规则
 - 二级页面菜单的 `parent` 指向一级组织菜单的 `name`
+- 二级页面菜单的 `parent` 生成值为 `<placement>.<一级菜单 name>`
 
 ### 2.2 路由
 
@@ -225,7 +226,7 @@ spec:
       "order": 999
     },
     {
-      "parent": "frontendintegrations/demo-fi/ops",
+      "parent": "workspace.frontendintegrations/demo-fi/ops",
       "name": "frontendintegrations/demo-fi/ops/inspecttasks",
       "title": "Inspect Tasks",
       "icon": "GridDuotone",
