@@ -135,7 +135,7 @@ impl ControllerConfig {
             job_active_deadline_seconds: env::var("JOB_ACTIVE_DEADLINE_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(90),
+                .unwrap_or(300),
             job_ttl_seconds_after_finished: env::var("JOB_TTL_SECONDS_AFTER_FINISHED")
                 .ok()
                 .and_then(|v| v.parse().ok())
