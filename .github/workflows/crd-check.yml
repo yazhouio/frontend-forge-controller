@@ -1,0 +1,34 @@
+name: CRD Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+jobs:
+  verify-generated-crd:
+    name: Verify generated CRD
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Regenerate CRD
+        run: cargo xtask gen-crd
+
+      - name: Ensure generated CRD is committed
+        run: git diff --exit-code -- config/crd/bases/frontend-forge.kubesphere.io_frontendintegrations.yaml

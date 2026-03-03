@@ -1,13 +1,7 @@
-use frontend_forge_api::FrontendIntegration;
-use kube::CustomResourceExt;
-use std::collections::BTreeMap;
+use frontend_forge_api::frontend_integration_crd;
 
 fn main() -> Result<(), serde_yaml::Error> {
-    let mut fi = FrontendIntegration::crd();
-    fi.metadata.labels.get_or_insert_with(BTreeMap::new).insert(
-        "kubesphere.io/resource-served".to_string(),
-        "true".to_string(),
-    );
+    let fi = frontend_integration_crd();
     // JSBundle is a third-party CRD (extensions.kubesphere.io) and is not generated here.
     println!("{}", serde_yaml::to_string(&fi)?);
     Ok(())

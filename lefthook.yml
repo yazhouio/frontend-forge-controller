@@ -1,0 +1,10 @@
+pre-commit:
+  commands:
+    gen-crd:
+      run: cargo xtask gen-crd
+      stage_fixed: true
+
+pre-push:
+  commands:
+    gen-crd:
+      run: cargo xtask gen-crd && git diff --exit-code -- config/crd/bases/frontend-forge.kubesphere.io_frontendintegrations.yaml
