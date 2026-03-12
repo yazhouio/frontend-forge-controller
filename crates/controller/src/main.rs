@@ -530,12 +530,8 @@ fn failure_error_for_status(
     spec_hash: &str,
     job: &Job,
 ) -> LastBuildError {
-    if let Some(status) = fi.status.as_ref() {
-        if status.observed_spec_hash.as_deref() == Some(spec_hash) {
-            if let Some(last_error) = status.last_error.clone() {
-                return last_error;
-            }
-        }
+    if let Some(last_error) = current_last_error(fi, spec_hash) {
+        return last_error;
     }
 
     extract_job_error(job).unwrap_or_else(|| LastBuildError {
@@ -544,6 +540,14 @@ fn failure_error_for_status(
         reason: Some("JobFailed".to_string()),
         occurred_at: Some(Utc::now()),
     })
+}
+
+fn current_last_error(fi: &FrontendIntegration, spec_hash: &str) -> Option<LastBuildError> {
+    let status = fi.status.as_ref()?;
+    if status.observed_spec_hash.as_deref() != Some(spec_hash) {
+        return None;
+    }
+    status.last_error.clone()
 }
 
 fn bundle_matches_spec_hash(bundle: &JSBundle, spec_hash: &str) -> bool {
@@ -936,7 +940,7 @@ fn building_status(
             namespace: None,
             uid: None,
         }),
-        last_error: None,
+        last_error: current_last_error(fi, spec_hash),
         message: Some(message.to_string()),
         conditions: vec![],
     }
@@ -1341,6 +1345,34 @@ mod tests {
             Some("fi-demo".to_string())
         );
         assert_eq!(status.message.as_deref(), Some("Disabled"));
+    }
+
+    #[test]
+    fn building_status_preserves_last_error_for_same_spec_hash() {
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                observed_spec_hash: Some("sha256:demo".to_string()),
+                last_error: Some(LastBuildError {
+                    source: "runner".to_string(),
+                    message: "duplicate page key".to_string(),
+                    reason: Some("RunnerFailed".to_string()),
+                    occurred_at: Some(Utc::now()),
+                }),
+                ..Default::default()
+            }),
+        );
+        let job = job_with_status(Some(1), None, None);
+
+        let status = building_status(&fi, "sha256:demo", "fi-demo", &job, "Build in progress");
+
+        assert_eq!(
+            status
+                .last_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("duplicate page key")
+        );
     }
 
     #[test]
