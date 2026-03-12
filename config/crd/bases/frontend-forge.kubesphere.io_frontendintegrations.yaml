@@ -255,6 +255,24 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              last_error:
+                nullable: true
+                properties:
+                  message:
+                    type: string
+                  occurred_at:
+                    format: date-time
+                    nullable: true
+                    type: string
+                  reason:
+                    nullable: true
+                    type: string
+                  source:
+                    type: string
+                required:
+                - message
+                - source
+                type: object
               message:
                 nullable: true
                 type: string

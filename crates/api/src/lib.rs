@@ -276,6 +276,16 @@ pub struct LastBuildStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+pub struct LastBuildError {
+    pub source: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 pub struct SimpleCondition {
     #[serde(rename = "type")]
     pub type_: String,
@@ -309,6 +319,8 @@ pub struct FrontendIntegrationStatus {
     pub last_build: Option<LastBuildStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_ref: Option<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<LastBuildError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -713,6 +725,23 @@ spec:
         assert_eq!(menus["icon"]["nullable"], true);
         assert_eq!(child["icon"]["type"], "string");
         assert_eq!(child["icon"]["nullable"], true);
+    }
+
+    #[test]
+    fn generated_crd_exposes_structured_last_error_status() {
+        let crd = frontend_integration_crd();
+        let schema = serde_json::to_value(&crd).unwrap();
+        let last_error = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["status"]["properties"]["last_error"];
+
+        assert_eq!(last_error["nullable"], true);
+        assert_eq!(last_error["properties"]["source"]["type"], "string");
+        assert_eq!(last_error["properties"]["message"]["type"], "string");
+        assert_eq!(last_error["properties"]["reason"]["nullable"], true);
+        assert_eq!(
+            last_error["properties"]["occurred_at"]["format"],
+            "date-time"
+        );
     }
 
     #[test]

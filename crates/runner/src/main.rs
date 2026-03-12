@@ -1,8 +1,9 @@
 mod manifest;
 
+use chrono::Utc;
 use frontend_forge_api::{
-    FrontendIntegration, JSBundle, JsBundleNamespacedKeyRef, JsBundleRawFromSpec, JsBundleSpec,
-    JsBundleStatus, ManifestRenderError,
+    FrontendIntegration, FrontendIntegrationPhase, JSBundle, JsBundleNamespacedKeyRef,
+    JsBundleRawFromSpec, JsBundleSpec, JsBundleStatus, LastBuildError, ManifestRenderError,
 };
 use frontend_forge_common::{
     ANNO_BUILD_JOB, ANNO_MANIFEST_CONTENT, ANNO_MANIFEST_HASH, CommonError, LABEL_ENABLED,
@@ -12,7 +13,7 @@ use frontend_forge_common::{
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Patch, PatchParams};
-use kube::{Api, Client, Resource};
+use kube::{Api, Client, Resource, ResourceExt};
 use serde::Deserialize;
 use serde_json::json;
 use snafu::{ResultExt, Snafu};
@@ -253,65 +254,74 @@ async fn run() -> Result<(), Error> {
                 namespace: "<cluster>".to_string(),
                 name: cfg.fi_name.clone(),
             })?;
-    let build_spec_hash = build_spec_hash(&fi_for_build).context(SpecHashSnafu)?;
-    if cfg.spec_hash != build_spec_hash {
-        warn!(
+    let outcome: Result<(), Error> = async {
+        let build_spec_hash = build_spec_hash(&fi_for_build).context(SpecHashSnafu)?;
+        if cfg.spec_hash != build_spec_hash {
+            warn!(
+                fi = %cfg.fi_name,
+                expected_spec_hash = %cfg.spec_hash,
+                actual_build_hash = %build_spec_hash,
+                "runner observed newer/different FI spec before build; skipping stale job"
+            );
+            return Ok(());
+        }
+        let manifest_value =
+            manifest::render_extension_manifest(&fi_for_build).context(RenderManifestSnafu)?;
+        let (manifest, manifest_hash) =
+            manifest_content_and_hash(&manifest_value).context(ManifestHashSnafu)?;
+
+        let build_client = BuildServiceClient::new(&cfg)?;
+
+        info!(
             fi = %cfg.fi_name,
-            expected_spec_hash = %cfg.spec_hash,
-            actual_build_hash = %build_spec_hash,
-            "runner observed newer/different FI spec before build; skipping stale job"
+            spec_hash = %cfg.spec_hash,
+            manifest_hash = %manifest_hash,
+            "starting build runner"
         );
-        return Ok(());
+        let files = build_client.build_project(&manifest).await?;
+        info!(files = files.len(), "build artifacts fetched");
+        let fi = stale_check(&fi_api, &cfg).await?;
+        let Some(fi) = fi else {
+            warn!("build became stale; exiting without writing JSBundle");
+            return Ok(());
+        };
+
+        let (bundle_key, bundle_content) = select_bundle_artifact(&cfg, files)?;
+        let configmap_name = bundle_configmap_name(&cfg.jsbundle_name);
+        let configmap_api =
+            Api::<ConfigMap>::namespaced(kube.clone(), &cfg.jsbundle_configmap_namespace);
+        upsert_bundle_configmap(
+            &configmap_api,
+            &cfg,
+            &fi,
+            &configmap_name,
+            &bundle_key,
+            &bundle_content,
+            &manifest_hash,
+        )
+        .await?;
+
+        let bundle_api = Api::<JSBundle>::all(kube);
+        upsert_jsbundle(
+            &bundle_api,
+            &cfg,
+            &fi,
+            &configmap_name,
+            &bundle_key,
+            &manifest,
+            &manifest_hash,
+        )
+        .await?;
+        info!(bundle = %cfg.jsbundle_name, "jsbundle upserted");
+        Ok(())
     }
-    let manifest_value =
-        manifest::render_extension_manifest(&fi_for_build).context(RenderManifestSnafu)?;
-    let (manifest, manifest_hash) =
-        manifest_content_and_hash(&manifest_value).context(ManifestHashSnafu)?;
+    .await;
 
-    let build_client = BuildServiceClient::new(&cfg)?;
+    if let Err(err) = &outcome {
+        patch_fi_failure_status(&fi_api, &fi_for_build, &cfg.spec_hash, &err.to_string()).await;
+    }
 
-    info!(
-        fi = %cfg.fi_name,
-        spec_hash = %cfg.spec_hash,
-        manifest_hash = %manifest_hash,
-        "starting build runner"
-    );
-    let files = build_client.build_project(&manifest).await?;
-    info!(files = files.len(), "build artifacts fetched");
-    let fi = stale_check(&fi_api, &cfg).await?;
-    let Some(fi) = fi else {
-        warn!("build became stale; exiting without writing JSBundle");
-        return Ok(());
-    };
-
-    let (bundle_key, bundle_content) = select_bundle_artifact(&cfg, files)?;
-    let configmap_name = bundle_configmap_name(&cfg.jsbundle_name);
-    let configmap_api =
-        Api::<ConfigMap>::namespaced(kube.clone(), &cfg.jsbundle_configmap_namespace);
-    upsert_bundle_configmap(
-        &configmap_api,
-        &cfg,
-        &fi,
-        &configmap_name,
-        &bundle_key,
-        &bundle_content,
-        &manifest_hash,
-    )
-    .await?;
-
-    let bundle_api = Api::<JSBundle>::all(kube);
-    upsert_jsbundle(
-        &bundle_api,
-        &cfg,
-        &fi,
-        &configmap_name,
-        &bundle_key,
-        &manifest,
-        &manifest_hash,
-    )
-    .await?;
-    info!(bundle = %cfg.jsbundle_name, "jsbundle upserted");
-    Ok(())
+    outcome
 }
 
 async fn stale_check(
@@ -550,6 +560,62 @@ async fn patch_jsbundle_status(
     }
 }
 
+async fn patch_fi_failure_status(
+    fi_api: &Api<FrontendIntegration>,
+    fi: &FrontendIntegration,
+    spec_hash: &str,
+    message: &str,
+) {
+    let fi_name = fi.name_any();
+    let namespace = fi.namespace().unwrap_or_else(|| "<cluster>".to_string());
+    let last_error = LastBuildError {
+        source: "runner".to_string(),
+        message: message.to_string(),
+        reason: Some("RunnerFailed".to_string()),
+        occurred_at: Some(Utc::now()),
+    };
+    let patch = runner_failure_status_patch(fi, spec_hash, message, &last_error);
+
+    if let Err(err) = fi_api
+        .patch_status(&fi_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+    {
+        warn!(
+            error = %err,
+            fi = %fi_name,
+            namespace = %namespace,
+            "failed to patch FrontendIntegration status with runner error"
+        );
+    }
+}
+
+fn runner_failure_status_patch(
+    fi: &FrontendIntegration,
+    spec_hash: &str,
+    message: &str,
+    last_error: &LastBuildError,
+) -> serde_json::Value {
+    let mut status_patch = json!({
+        "phase": FrontendIntegrationPhase::Failed,
+        "observed_spec_hash": spec_hash,
+        "observed_generation": fi.metadata.generation.unwrap_or_default(),
+        "message": message,
+        "last_error": last_error,
+    });
+
+    if let Some(observed_manifest_hash) = fi
+        .status
+        .as_ref()
+        .and_then(|status| status.observed_manifest_hash.clone())
+    {
+        status_patch["observed_manifest_hash"] = json!(observed_manifest_hash);
+    }
+
+    json!({
+        "status": status_patch,
+    })
+}
+
 fn select_bundle_artifact(
     cfg: &RunnerConfig,
     remote_files: Vec<RemoteFile>,
@@ -733,5 +799,34 @@ mod tests {
         assert_eq!(owner.uid, "fi-uid-123");
         assert_eq!(owner.controller, Some(true));
         Ok(())
+    }
+
+    #[test]
+    fn runner_failure_status_patch_includes_structured_error() {
+        let mut fi = test_fi("demo");
+        fi.metadata.generation = Some(7);
+        fi.status = Some(frontend_forge_api::FrontendIntegrationStatus {
+            observed_manifest_hash: Some("sha256:manifest".to_string()),
+            ..Default::default()
+        });
+        let last_error = LastBuildError {
+            source: "runner".to_string(),
+            message: "duplicate page key".to_string(),
+            reason: Some("RunnerFailed".to_string()),
+            occurred_at: None,
+        };
+
+        let patch =
+            runner_failure_status_patch(&fi, "sha256:spec", "duplicate page key", &last_error);
+
+        assert_eq!(patch["status"]["phase"], "Failed");
+        assert_eq!(patch["status"]["observed_spec_hash"], "sha256:spec");
+        assert_eq!(patch["status"]["observed_generation"], 7);
+        assert_eq!(patch["status"]["observed_manifest_hash"], "sha256:manifest");
+        assert_eq!(patch["status"]["last_error"]["source"], "runner");
+        assert_eq!(
+            patch["status"]["last_error"]["message"],
+            "duplicate page key"
+        );
     }
 }
