@@ -50,6 +50,9 @@ spec:
                         properties:
                           displayName:
                             type: string
+                          icon:
+                            nullable: true
+                            type: string
                           key:
                             type: string
                         required:
@@ -58,6 +61,9 @@ spec:
                         type: object
                       type: array
                     displayName:
+                      type: string
+                    icon:
+                      nullable: true
                       type: string
                     key:
                       type: string
@@ -139,11 +145,11 @@ spec:
                         names:
                           properties:
                             kind:
+                              nullable: true
                               type: string
                             plural:
                               type: string
                           required:
-                          - kind
                           - plural
                           type: object
                         scope:

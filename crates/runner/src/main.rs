@@ -615,6 +615,7 @@ mod tests {
                 menus: vec![PrimaryMenuSpec {
                     display_name: name.to_string(),
                     key: name.to_string(),
+                    icon: None,
                     placement: MenuPlacement::Global,
                     type_: MenuNodeType::Page,
                     children: vec![],

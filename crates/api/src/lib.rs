@@ -58,6 +58,8 @@ pub struct PrimaryMenuSpec {
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub placement: MenuPlacement,
     #[serde(rename = "type")]
     pub type_: MenuNodeType,
@@ -70,6 +72,8 @@ pub struct SecondaryMenuSpec {
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -120,7 +124,8 @@ pub struct CrdTablePageSpec {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct CrdNamesSpec {
-    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub plural: String,
 }
 
@@ -465,6 +470,77 @@ spec:
     }
 
     #[test]
+    fn deserializes_optional_menu_icons() {
+        let fi: FrontendIntegration = serde_yaml::from_str(
+            r#"
+apiVersion: frontend-forge.kubesphere.io/v1alpha1
+kind: FrontendIntegration
+metadata:
+  name: demo
+spec:
+  menus:
+    - displayName: Overview
+      key: overview
+      icon: Appstore
+      placement: cluster
+      type: page
+    - displayName: Ops
+      key: ops
+      icon: null
+      placement: workspace
+      type: organization
+      children:
+        - displayName: Inspect Tasks
+          key: inspecttasks
+          icon: Task
+        - displayName: Inspect Rules
+          key: inspectrules
+  pages:
+    - key: overview
+      type: iframe
+      iframe:
+        src: http://example.test/overview
+    - key: inspecttasks
+      type: crdTable
+      crdTable:
+        names:
+          plural: inspecttasks
+          kind: InspectTask
+        group: kubeeye.kubesphere.io
+        version: v1alpha2
+        scope: Cluster
+        columns:
+          - key: name
+            title: NAME
+            render:
+              type: text
+              path: metadata.name
+    - key: inspectrules
+      type: crdTable
+      crdTable:
+        names:
+          plural: inspectrules
+          kind: InspectRule
+        group: kubeeye.kubesphere.io
+        version: v1alpha2
+        scope: Cluster
+        columns:
+          - key: name
+            title: NAME
+            render:
+              type: text
+              path: metadata.name
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(fi.spec.menus[0].icon.as_deref(), Some("Appstore"));
+        assert_eq!(fi.spec.menus[1].icon, None);
+        assert_eq!(fi.spec.menus[1].children[0].icon.as_deref(), Some("Task"));
+        assert_eq!(fi.spec.menus[1].children[1].icon, None);
+    }
+
+    #[test]
     fn deserializes_optional_display_name_and_locales() {
         let fi: FrontendIntegration = serde_yaml::from_str(
             r#"
@@ -514,6 +590,90 @@ spec:
     }
 
     #[test]
+    fn deserializes_crd_table_without_kind() {
+        let missing_kind: FrontendIntegration = serde_yaml::from_str(
+            r#"
+apiVersion: frontend-forge.kubesphere.io/v1alpha1
+kind: FrontendIntegration
+metadata:
+  name: demo
+spec:
+  menus:
+    - displayName: Inspect Tasks
+      key: inspecttasks
+      placement: cluster
+      type: page
+  pages:
+    - key: inspecttasks
+      type: crdTable
+      crdTable:
+        names:
+          plural: inspecttasks
+        group: kubeeye.kubesphere.io
+        version: v1alpha2
+        scope: Cluster
+        columns:
+          - key: name
+            title: NAME
+            render:
+              type: text
+              path: metadata.name
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            missing_kind.spec.pages[0]
+                .crd_table
+                .as_ref()
+                .unwrap()
+                .names
+                .kind,
+            None
+        );
+
+        let null_kind: FrontendIntegration = serde_yaml::from_str(
+            r#"
+apiVersion: frontend-forge.kubesphere.io/v1alpha1
+kind: FrontendIntegration
+metadata:
+  name: demo
+spec:
+  menus:
+    - displayName: Inspect Tasks
+      key: inspecttasks
+      placement: cluster
+      type: page
+  pages:
+    - key: inspecttasks
+      type: crdTable
+      crdTable:
+        names:
+          plural: inspecttasks
+          kind: null
+        group: kubeeye.kubesphere.io
+        version: v1alpha2
+        scope: Cluster
+        columns:
+          - key: name
+            title: NAME
+            render:
+              type: text
+              path: metadata.name
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            null_kind.spec.pages[0]
+                .crd_table
+                .as_ref()
+                .unwrap()
+                .names
+                .kind,
+            None
+        );
+    }
+
+    #[test]
     fn generated_crd_drops_legacy_fields() {
         let crd = frontend_integration_crd();
         let schema = serde_json::to_value(&crd).unwrap();
@@ -527,6 +687,32 @@ spec:
         assert!(spec_properties.get("routing").is_none());
         assert!(spec_properties.get("columns").is_none());
         assert!(spec_properties.get("menu").is_none());
+    }
+
+    #[test]
+    fn generated_crd_allows_missing_crd_kind() {
+        let crd = frontend_integration_crd();
+        let schema = serde_json::to_value(&crd).unwrap();
+        let names = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["pages"]["items"]["properties"]["crdTable"]["properties"]["names"];
+        let required = names["required"].as_array().unwrap();
+
+        assert_eq!(names["properties"]["kind"]["type"], "string");
+        assert_eq!(required, &vec![Value::String("plural".to_string())]);
+    }
+
+    #[test]
+    fn generated_crd_allows_optional_menu_icons() {
+        let crd = frontend_integration_crd();
+        let schema = serde_json::to_value(&crd).unwrap();
+        let menus = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["menus"]["items"]["properties"];
+        let child = &menus["children"]["items"]["properties"];
+
+        assert_eq!(menus["icon"]["type"], "string");
+        assert_eq!(menus["icon"]["nullable"], true);
+        assert_eq!(child["icon"]["type"], "string");
+        assert_eq!(child["icon"]["nullable"], true);
     }
 
     #[test]
