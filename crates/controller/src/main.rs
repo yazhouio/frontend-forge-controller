@@ -269,7 +269,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
             &spec_hash,
             &desired_bundle_name,
             &chosen_job,
-            "Build job scheduled",
+            "Build in progress",
         );
         patch_fi_status(&fi_api, &fi, status).await?;
         return Ok(Action::requeue(Duration::from_secs(
@@ -931,6 +931,8 @@ fn building_status(
     job: &Job,
     message: &str,
 ) -> FrontendIntegrationStatus {
+    let started_at = existing_build_started_at(fi, spec_hash, job).unwrap_or_else(Utc::now);
+
     FrontendIntegrationStatus {
         phase: FrontendIntegrationPhase::Building,
         observed_spec_hash: Some(spec_hash.to_string()),
@@ -941,7 +943,7 @@ fn building_status(
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
         last_build: Some(LastBuildStatus {
             job_ref: Some(resource_ref(job)),
-            started_at: Some(Utc::now()),
+            started_at: Some(started_at),
         }),
         bundle_ref: Some(ResourceRef {
             name: bundle_name.to_string(),
@@ -1026,11 +1028,45 @@ fn failed_status(
     }
 }
 
+fn existing_build_started_at(
+    fi: &FrontendIntegration,
+    spec_hash: &str,
+    job: &Job,
+) -> Option<chrono::DateTime<Utc>> {
+    let status = fi.status.as_ref()?;
+    let observed_hash = status
+        .observed_spec_hash
+        .as_deref()
+        .or(status.observed_manifest_hash.as_deref());
+    if observed_hash != Some(spec_hash) {
+        return None;
+    }
+
+    let last_build = status.last_build.as_ref()?;
+    let current_job_name = last_build.job_ref.as_ref()?.name.as_str();
+    if current_job_name != job.name_any() {
+        return None;
+    }
+
+    last_build.started_at
+}
+
+fn fi_status_needs_patch(
+    fi: &FrontendIntegration,
+    desired_status: &FrontendIntegrationStatus,
+) -> bool {
+    fi.status.as_ref() != Some(desired_status)
+}
+
 async fn patch_fi_status(
     fi_api: &Api<FrontendIntegration>,
     fi: &FrontendIntegration,
     status: FrontendIntegrationStatus,
 ) -> Result<(), Error> {
+    if !fi_status_needs_patch(fi, &status) {
+        return Ok(());
+    }
+
     let fi_name = fi.name_any();
     let namespace = fi.namespace().unwrap_or_else(|| "<cluster>".to_string());
     let patch = frontend_integration_status_patch(&status, &namespace, &fi_name)?;
@@ -1381,6 +1417,63 @@ mod tests {
                 .map(|error| error.message.as_str()),
             Some("duplicate page key")
         );
+    }
+
+    #[test]
+    fn building_status_preserves_started_at_for_same_job() {
+        let started_at = Utc::now();
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                phase: FrontendIntegrationPhase::Building,
+                observed_spec_hash: Some("sha256:demo".to_string()),
+                last_build: Some(LastBuildStatus {
+                    job_ref: Some(ResourceRef {
+                        name: "build-job".to_string(),
+                        namespace: Some("default".to_string()),
+                        uid: Some("job-uid".to_string()),
+                    }),
+                    started_at: Some(started_at),
+                }),
+                ..Default::default()
+            }),
+        );
+        let mut job = job_with_status(Some(1), None, None);
+        job.metadata.name = Some("build-job".to_string());
+
+        let status = building_status(&fi, "sha256:demo", "fi-demo", &job, "Build in progress");
+
+        assert_eq!(
+            status.last_build.and_then(|build| build.started_at),
+            Some(started_at)
+        );
+    }
+
+    #[test]
+    fn status_patch_is_skipped_when_status_is_unchanged() {
+        let status = FrontendIntegrationStatus {
+            phase: FrontendIntegrationPhase::Building,
+            observed_spec_hash: Some("sha256:demo".to_string()),
+            observed_generation: Some(3),
+            last_build: Some(LastBuildStatus {
+                job_ref: Some(ResourceRef {
+                    name: "build-job".to_string(),
+                    namespace: Some("default".to_string()),
+                    uid: Some("job-uid".to_string()),
+                }),
+                started_at: Some(Utc::now()),
+            }),
+            bundle_ref: Some(ResourceRef {
+                name: "fi-demo".to_string(),
+                namespace: None,
+                uid: None,
+            }),
+            message: Some("Build in progress".to_string()),
+            ..Default::default()
+        };
+        let fi = fi("demo", Some(status.clone()));
+
+        assert!(!fi_status_needs_patch(&fi, &status));
     }
 
     #[test]
