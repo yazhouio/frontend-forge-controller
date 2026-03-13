@@ -516,6 +516,8 @@ fn crd_page(
 
 fn crd_create_initial_value(crd: &CrdTablePageSpec) -> Value {
     let mut initial = Map::new();
+    let mut metadata = Map::new();
+
     initial.insert(
         "apiVersion".to_string(),
         json!(format!("{}/{}", crd.group, crd.version)),
@@ -523,6 +525,14 @@ fn crd_create_initial_value(crd: &CrdTablePageSpec) -> Value {
     if let Some(kind) = crd.names.kind.as_ref() {
         initial.insert("kind".to_string(), json!(kind));
     }
+    metadata.insert("name".to_string(), json!(""));
+    metadata.insert("labels".to_string(), json!({}));
+    metadata.insert("annotations".to_string(), json!({}));
+    if crd.scope == CrdScope::Namespaced {
+        metadata.insert("namespace".to_string(), json!(""));
+    }
+    initial.insert("metadata".to_string(), Value::Object(metadata));
+    initial.insert("spec".to_string(), json!({}));
     Value::Object(initial)
 }
 
@@ -977,7 +987,13 @@ spec:
         assert_eq!(
             props["CREATE_INITIAL_VALUE"],
             json!({
-                "apiVersion": "kubeeye.kubesphere.io/v1alpha2"
+                "apiVersion": "kubeeye.kubesphere.io/v1alpha2",
+                "metadata": {
+                    "name": "",
+                    "labels": {},
+                    "annotations": {}
+                },
+                "spec": {}
             })
         );
         assert_eq!(
@@ -987,6 +1003,60 @@ spec:
                 "plural": "inspecttasks",
                 "group": "kubeeye.kubesphere.io",
                 "kapi": true
+            })
+        );
+    }
+
+    #[test]
+    fn includes_kind_metadata_and_spec_in_crd_create_initial_value() {
+        let fi: FrontendIntegration = serde_yaml::from_str(
+            r#"
+apiVersion: frontend-forge.kubesphere.io/v1alpha1
+kind: FrontendIntegration
+metadata:
+  name: demo-fi
+spec:
+  menus:
+    - displayName: Cluster Tasks
+      key: cluster-tasks
+      placement: cluster
+      type: page
+  pages:
+    - key: cluster-tasks
+      type: crdTable
+      crdTable:
+        names:
+          plural: serviceaccounts
+          kind: ServiceAccount
+        version: v1alpha1
+        group: kubesphere.io
+        scope: Namespaced
+        columns:
+          - key: name
+            title: NAME
+            render:
+              type: text
+              path: metadata.name
+"#,
+        )
+        .unwrap();
+
+        let manifest = render_v1_manifest(&fi).unwrap();
+        let page = &manifest["pages"].as_array().unwrap()[0];
+        let props = &page["componentsTree"]["root"]["props"];
+
+        assert_eq!(
+            props["CREATE_INITIAL_VALUE"],
+            json!({
+                "apiVersion": "kubesphere.io/v1alpha1",
+                "kind": "ServiceAccount",
+                "metadata": {
+                    "name": "",
+                    "labels": {},
+                    "annotations": {},
+                    "namespace": ""
+                },
+                "spec": {}
             })
         );
     }
