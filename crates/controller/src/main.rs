@@ -1,7 +1,7 @@
 use chrono::Utc;
 use frontend_forge_api::{
     FrontendIntegration, FrontendIntegrationPhase, FrontendIntegrationStatus, JSBundle,
-    LastBuildStatus, ResourceRef,
+    LastBuildError, LastBuildStatus, ResourceRef,
 };
 use frontend_forge_common::{
     ANNO_MANIFEST_HASH, ANNO_OBSERVED_GENERATION, BUILD_KIND_VALUE, CommonError, LABEL_BUILD_KIND,
@@ -39,6 +39,12 @@ enum Error {
     },
     #[snafu(display("failed to patch FrontendIntegration metadata {namespace}/{name}: {source}"))]
     PatchFrontendIntegrationMetadata {
+        namespace: String,
+        name: String,
+        source: kube::Error,
+    },
+    #[snafu(display("failed to get FrontendIntegration {namespace}/{name}: {source}"))]
+    GetFrontendIntegration {
         namespace: String,
         name: String,
         source: kube::Error,
@@ -263,7 +269,7 @@ async fn reconcile(fi: Arc<FrontendIntegration>, ctx: Arc<ContextData>) -> Resul
             &spec_hash,
             &desired_bundle_name,
             &chosen_job,
-            "Build job scheduled",
+            "Build in progress",
         );
         patch_fi_status(&fi_api, &fi, status).await?;
         return Ok(Action::requeue(Duration::from_secs(
@@ -345,15 +351,20 @@ async fn sync_status_from_children(
     if let Some(job) = current_job {
         match observed_job_phase(job.status.as_ref()) {
             ObservedJobPhase::Pending | ObservedJobPhase::Running => {
-                let status = building_status(fi, spec_hash, bundle_name, &job, "Build in progress");
-                patch_fi_status(fi_api, fi, status).await?;
+                let live_fi = get_live_fi(fi_api, &fi_name).await?;
+                let status =
+                    building_status(&live_fi, spec_hash, bundle_name, &job, "Build in progress");
+                patch_fi_status(fi_api, &live_fi, status).await?;
                 return Ok(Action::requeue(Duration::from_secs(requeue_seconds)));
             }
             ObservedJobPhase::Failed => {
-                let msg =
-                    extract_job_message(&job).unwrap_or_else(|| "Build job failed".to_string());
-                let status = failed_status(fi, spec_hash, msg);
-                patch_fi_status(fi_api, fi, status).await?;
+                let live_fi = get_live_fi(fi_api, &fi_name).await?;
+                let status = failed_status(
+                    &live_fi,
+                    spec_hash,
+                    failure_error_for_status(&live_fi, spec_hash, &job),
+                );
+                patch_fi_status(fi_api, &live_fi, status).await?;
                 return Ok(Action::await_change());
             }
             ObservedJobPhase::Succeeded => {
@@ -399,6 +410,7 @@ async fn sync_status_from_children(
                 observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
                 last_build: fi.status.as_ref().and_then(|s| s.last_build.clone()),
                 bundle_ref: Some(resource_ref(&bundle)),
+                last_error: None,
                 message: Some("JSBundle ready".to_string()),
                 conditions: vec![],
             };
@@ -407,6 +419,19 @@ async fn sync_status_from_children(
     }
 
     Ok(Action::await_change())
+}
+
+async fn get_live_fi(
+    fi_api: &Api<FrontendIntegration>,
+    fi_name: &str,
+) -> Result<FrontendIntegration, Error> {
+    fi_api
+        .get(fi_name)
+        .await
+        .with_context(|_| GetFrontendIntegrationSnafu {
+            namespace: "<cluster>".to_string(),
+            name: fi_name.to_string(),
+        })
 }
 
 async fn find_job_for_hash(
@@ -489,6 +514,48 @@ fn extract_job_message(job: &Job) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_job_error(job: &Job) -> Option<LastBuildError> {
+    let status = job.status.as_ref()?;
+    let cond = status
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.status == "True" && c.type_ == "Failed")?;
+    let message = cond.message.clone().or_else(|| cond.reason.clone())?;
+
+    Some(LastBuildError {
+        source: "job".to_string(),
+        message,
+        reason: cond.reason.clone(),
+        occurred_at: Some(Utc::now()),
+    })
+}
+
+fn failure_error_for_status(
+    fi: &FrontendIntegration,
+    spec_hash: &str,
+    job: &Job,
+) -> LastBuildError {
+    if let Some(last_error) = current_last_error(fi, spec_hash) {
+        return last_error;
+    }
+
+    extract_job_error(job).unwrap_or_else(|| LastBuildError {
+        source: "job".to_string(),
+        message: extract_job_message(job).unwrap_or_else(|| "Build job failed".to_string()),
+        reason: Some("JobFailed".to_string()),
+        occurred_at: Some(Utc::now()),
+    })
+}
+
+fn current_last_error(fi: &FrontendIntegration, spec_hash: &str) -> Option<LastBuildError> {
+    let status = fi.status.as_ref()?;
+    if status.observed_spec_hash.as_deref() != Some(spec_hash) {
+        return None;
+    }
+    status.last_error.clone()
 }
 
 fn bundle_matches_spec_hash(bundle: &JSBundle, spec_hash: &str) -> bool {
@@ -851,6 +918,7 @@ fn disabled_status(
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
         last_build: None,
         bundle_ref: bundle.map(resource_ref),
+        last_error: None,
         message: Some("Disabled".to_string()),
         conditions: vec![],
     }
@@ -863,6 +931,8 @@ fn building_status(
     job: &Job,
     message: &str,
 ) -> FrontendIntegrationStatus {
+    let started_at = existing_build_started_at(fi, spec_hash, job).unwrap_or_else(Utc::now);
+
     FrontendIntegrationStatus {
         phase: FrontendIntegrationPhase::Building,
         observed_spec_hash: Some(spec_hash.to_string()),
@@ -873,13 +943,14 @@ fn building_status(
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
         last_build: Some(LastBuildStatus {
             job_ref: Some(resource_ref(job)),
-            started_at: Some(Utc::now()),
+            started_at: Some(started_at),
         }),
         bundle_ref: Some(ResourceRef {
             name: bundle_name.to_string(),
             namespace: None,
             uid: None,
         }),
+        last_error: current_last_error(fi, spec_hash),
         message: Some(message.to_string()),
         conditions: vec![],
     }
@@ -905,6 +976,7 @@ fn succeeded_status(
                 .and_then(|b| b.started_at),
         }),
         bundle_ref: Some(resource_ref(bundle)),
+        last_error: None,
         message: Some("Build succeeded".to_string()),
         conditions: vec![],
     }
@@ -938,7 +1010,7 @@ fn bundle_manifest_hash(bundle: &JSBundle) -> Option<String> {
 fn failed_status(
     fi: &FrontendIntegration,
     spec_hash: &str,
-    message: String,
+    last_error: LastBuildError,
 ) -> FrontendIntegrationStatus {
     FrontendIntegrationStatus {
         phase: FrontendIntegrationPhase::Failed,
@@ -950,9 +1022,40 @@ fn failed_status(
         observed_generation: Some(fi.metadata.generation.unwrap_or_default()),
         last_build: fi.status.as_ref().and_then(|s| s.last_build.clone()),
         bundle_ref: fi.status.as_ref().and_then(|s| s.bundle_ref.clone()),
-        message: Some(message),
+        message: Some(last_error.message.clone()),
+        last_error: Some(last_error),
         conditions: vec![],
     }
+}
+
+fn existing_build_started_at(
+    fi: &FrontendIntegration,
+    spec_hash: &str,
+    job: &Job,
+) -> Option<chrono::DateTime<Utc>> {
+    let status = fi.status.as_ref()?;
+    let observed_hash = status
+        .observed_spec_hash
+        .as_deref()
+        .or(status.observed_manifest_hash.as_deref());
+    if observed_hash != Some(spec_hash) {
+        return None;
+    }
+
+    let last_build = status.last_build.as_ref()?;
+    let current_job_name = last_build.job_ref.as_ref()?.name.as_str();
+    if current_job_name != job.name_any() {
+        return None;
+    }
+
+    last_build.started_at
+}
+
+fn fi_status_needs_patch(
+    fi: &FrontendIntegration,
+    desired_status: &FrontendIntegrationStatus,
+) -> bool {
+    fi.status.as_ref() != Some(desired_status)
 }
 
 async fn patch_fi_status(
@@ -960,6 +1063,10 @@ async fn patch_fi_status(
     fi: &FrontendIntegration,
     status: FrontendIntegrationStatus,
 ) -> Result<(), Error> {
+    if !fi_status_needs_patch(fi, &status) {
+        return Ok(());
+    }
+
     let fi_name = fi.name_any();
     let namespace = fi.namespace().unwrap_or_else(|| "<cluster>".to_string());
     let patch = frontend_integration_status_patch(&status, &namespace, &fi_name)?;
@@ -999,6 +1106,9 @@ fn frontend_integration_status_patch(
     if status.bundle_ref.is_none() {
         status_object.insert("bundle_ref".to_string(), serde_json::Value::Null);
     }
+    if status.last_error.is_none() {
+        status_object.insert("last_error".to_string(), serde_json::Value::Null);
+    }
 
     Ok(json!({
         "status": status_value,
@@ -1009,8 +1119,8 @@ fn frontend_integration_status_patch(
 mod tests {
     use super::*;
     use frontend_forge_api::{
-        FrontendIntegrationSpec, IframePageSpec, MenuNodeType, MenuPlacement, PageSpec, PageType,
-        PrimaryMenuSpec,
+        FrontendIntegrationSpec, IframePageSpec, LastBuildError, MenuNodeType, MenuPlacement,
+        PageSpec, PageType, PrimaryMenuSpec,
     };
     use k8s_openapi::api::batch::v1::JobStatus;
     use kube::core::ObjectMeta;
@@ -1025,10 +1135,12 @@ mod tests {
             },
             spec: FrontendIntegrationSpec {
                 display_name: None,
+                locales: BTreeMap::new(),
                 enabled: Some(true),
                 menus: vec![PrimaryMenuSpec {
                     display_name: "demo".to_string(),
                     key: "demo".to_string(),
+                    icon: None,
                     placement: MenuPlacement::Global,
                     type_: MenuNodeType::Page,
                     children: vec![],
@@ -1160,6 +1272,23 @@ mod tests {
         }
     }
 
+    fn job_with_failed_condition(message: Option<&str>, reason: Option<&str>) -> Job {
+        Job {
+            status: Some(JobStatus {
+                conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
+                    message: message.map(str::to_string),
+                    reason: reason.map(str::to_string),
+                    status: "True".to_string(),
+                    type_: "Failed".to_string(),
+                    ..Default::default()
+                }]),
+                failed: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn does_not_reuse_failed_job_when_retrying_failed_phase() {
         let fi = fi(
@@ -1263,17 +1392,130 @@ mod tests {
     }
 
     #[test]
+    fn building_status_preserves_last_error_for_same_spec_hash() {
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                observed_spec_hash: Some("sha256:demo".to_string()),
+                last_error: Some(LastBuildError {
+                    source: "runner".to_string(),
+                    message: "duplicate page key".to_string(),
+                    reason: Some("RunnerFailed".to_string()),
+                    occurred_at: Some(Utc::now()),
+                }),
+                ..Default::default()
+            }),
+        );
+        let job = job_with_status(Some(1), None, None);
+
+        let status = building_status(&fi, "sha256:demo", "fi-demo", &job, "Build in progress");
+
+        assert_eq!(
+            status
+                .last_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("duplicate page key")
+        );
+    }
+
+    #[test]
+    fn building_status_preserves_started_at_for_same_job() {
+        let started_at = Utc::now();
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                phase: FrontendIntegrationPhase::Building,
+                observed_spec_hash: Some("sha256:demo".to_string()),
+                last_build: Some(LastBuildStatus {
+                    job_ref: Some(ResourceRef {
+                        name: "build-job".to_string(),
+                        namespace: Some("default".to_string()),
+                        uid: Some("job-uid".to_string()),
+                    }),
+                    started_at: Some(started_at),
+                }),
+                ..Default::default()
+            }),
+        );
+        let mut job = job_with_status(Some(1), None, None);
+        job.metadata.name = Some("build-job".to_string());
+
+        let status = building_status(&fi, "sha256:demo", "fi-demo", &job, "Build in progress");
+
+        assert_eq!(
+            status.last_build.and_then(|build| build.started_at),
+            Some(started_at)
+        );
+    }
+
+    #[test]
+    fn status_patch_is_skipped_when_status_is_unchanged() {
+        let status = FrontendIntegrationStatus {
+            phase: FrontendIntegrationPhase::Building,
+            observed_spec_hash: Some("sha256:demo".to_string()),
+            observed_generation: Some(3),
+            last_build: Some(LastBuildStatus {
+                job_ref: Some(ResourceRef {
+                    name: "build-job".to_string(),
+                    namespace: Some("default".to_string()),
+                    uid: Some("job-uid".to_string()),
+                }),
+                started_at: Some(Utc::now()),
+            }),
+            bundle_ref: Some(ResourceRef {
+                name: "fi-demo".to_string(),
+                namespace: None,
+                uid: None,
+            }),
+            message: Some("Build in progress".to_string()),
+            ..Default::default()
+        };
+        let fi = fi("demo", Some(status.clone()));
+
+        assert!(!fi_status_needs_patch(&fi, &status));
+    }
+
+    #[test]
+    fn failure_error_prefers_existing_runner_error_for_same_spec_hash() {
+        let fi = fi(
+            "demo",
+            Some(FrontendIntegrationStatus {
+                observed_spec_hash: Some("sha256:demo".to_string()),
+                last_error: Some(LastBuildError {
+                    source: "runner".to_string(),
+                    message: "duplicate page key".to_string(),
+                    reason: Some("RunnerFailed".to_string()),
+                    occurred_at: Some(Utc::now()),
+                }),
+                ..Default::default()
+            }),
+        );
+        let job = job_with_failed_condition(
+            Some("Job has reached the specified backoff limit"),
+            Some("BackoffLimitExceeded"),
+        );
+
+        let failure = failure_error_for_status(&fi, "sha256:demo", &job);
+
+        assert_eq!(failure.source, "runner");
+        assert_eq!(failure.message, "duplicate page key");
+    }
+
+    #[test]
     fn status_patch_sets_null_for_cleared_optional_refs() -> Result<(), Error> {
         let status = FrontendIntegrationStatus {
             phase: FrontendIntegrationPhase::Pending,
             last_build: None,
             bundle_ref: None,
+            last_error: None,
             ..Default::default()
         };
         let patch = frontend_integration_status_patch(&status, "default", "demo")?;
 
         assert_eq!(patch["status"]["last_build"], serde_json::Value::Null);
         assert_eq!(patch["status"]["bundle_ref"], serde_json::Value::Null);
+        assert_eq!(patch["status"]["last_error"], serde_json::Value::Null);
         Ok(())
     }
 }

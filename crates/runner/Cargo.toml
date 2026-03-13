@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 frontend-forge-api = { path = "../api" }
 frontend-forge-common = { path = "../common" }
 k8s-openapi.workspace = true
