@@ -460,6 +460,7 @@ fn crd_page(
     let columns_config = transform_columns(columns);
     let page_state_type = crd_page_state_type(placement);
     let page_state_config = crd_page_state_config(page_id, placement, crd);
+    let auth_key = crd.auth_key.as_deref().unwrap_or("");
 
     json!({
       "id": page_id,
@@ -506,7 +507,8 @@ fn crd_page(
             "UPDATE": { "type": "binding", "source": "pageState", "bind": "update" },
             "DEL": { "type": "binding", "source": "pageState", "bind": "del" },
             "CREATE": { "type": "binding", "source": "pageState", "bind": "create" },
-            "CREATE_INITIAL_VALUE": crd_create_initial_value(crd)
+            "CREATE_INITIAL_VALUE": crd_create_initial_value(crd),
+            "AUTH_KEY": auth_key
           },
           "meta": { "title": "CrdTable", "scope": true }
         }
@@ -1005,6 +1007,7 @@ spec:
                 "kapi": true
             })
         );
+        assert_eq!(props["AUTH_KEY"], "");
     }
 
     #[test]
@@ -1059,6 +1062,50 @@ spec:
                 "spec": {}
             })
         );
+    }
+
+    #[test]
+    fn includes_auth_key_in_crd_table_props_when_present() {
+        let fi: FrontendIntegration = serde_yaml::from_str(
+            r#"
+apiVersion: frontend-forge.kubesphere.io/v1alpha1
+kind: FrontendIntegration
+metadata:
+  name: demo-fi
+spec:
+  menus:
+    - displayName: Inspect Tasks
+      key: inspecttasks
+      placement: cluster
+      type: page
+  pages:
+    - key: inspecttasks
+      type: crdTable
+      crdTable:
+        names:
+          plural: inspecttasks
+          kind: InspectTask
+        group: kubeeye.kubesphere.io
+        version: v1alpha2
+        authKey: kubeeye-auth
+        scope: Cluster
+        columns:
+          - key: name
+            title: NAME
+            render:
+              type: text
+              path: metadata.name
+"#,
+        )
+        .unwrap();
+
+        let manifest = render_v1_manifest(&fi).unwrap();
+        let page = &manifest["pages"].as_array().unwrap()[0];
+        let props = &page["componentsTree"]["root"]["props"];
+        let page_state = &page["componentsTree"]["dataSources"][1];
+
+        assert_eq!(props["AUTH_KEY"], "kubeeye-auth");
+        assert!(page_state["config"]["CRD_CONFIG"].get("authKey").is_none());
     }
 
     #[test]

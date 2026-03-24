@@ -188,7 +188,7 @@ async fn main() -> Result<(), Error> {
     });
 
     let fi_api = Api::<FrontendIntegration>::all(client.clone());
-    let job_api = Api::<Job>::all(client.clone());
+    let job_api = Api::<Job>::namespaced(client.clone(), &ctx.config.work_namespace);
     Controller::new(fi_api, watcher::Config::default())
         .owns(job_api, watcher::Config::default())
         .shutdown_on_signal()
