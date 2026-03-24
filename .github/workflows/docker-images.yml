@@ -1,11 +1,11 @@
 name: Build And Push Docker Images
 
 on:
-  pull_request_target:
-    branches: [main]
-    types: [closed]
-  release:
-    types: [published]
+  push:
+    branches:
+      - '**'
+    tags:
+      - '*'
 
 permissions:
   contents: read
