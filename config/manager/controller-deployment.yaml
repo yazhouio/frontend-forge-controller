@@ -63,3 +63,8 @@ spec:
           secret:
             secretName: frontend-forge-controller-webhook-tls
             optional: true
+            items:
+              - key: cert
+                path: tls.crt
+              - key: key
+                path: tls.key

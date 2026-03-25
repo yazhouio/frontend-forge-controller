@@ -199,8 +199,18 @@ fn build_spec_hash(fi: &FrontendIntegration) -> Result<String, CommonError> {
     serializable_hash(&fi.spec.without_enabled())
 }
 
+fn install_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("ring crypto provider should install before controller startup");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    install_rustls_crypto_provider();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
