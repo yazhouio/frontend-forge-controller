@@ -1,8 +1,6 @@
-#[path = "../src/manifest.rs"]
-mod manifest;
-
 use frontend_forge_api::FrontendIntegration;
 use frontend_forge_common::manifest_content_and_hash;
+use frontend_forge_manifest::render_extension_manifest;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use serde_json::json;
@@ -41,7 +39,7 @@ async fn main() -> Result<(), DynError> {
     let args = parse_args()?;
     let fi_text = fs::read_to_string(&args.fi_yaml_path)?;
     let fi: FrontendIntegration = serde_yaml::from_str(&fi_text)?;
-    let manifest_value = manifest::render_extension_manifest(&fi)?;
+    let manifest_value = render_extension_manifest(&fi)?;
     let (manifest_content, manifest_hash) = manifest_content_and_hash(&manifest_value)?;
 
     fs::create_dir_all(&args.output_dir)?;

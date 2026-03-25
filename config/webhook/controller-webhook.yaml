@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-forge-controller-webhook
+  namespace: extension-frontend-forge
+spec:
+  selector:
+    app.kubernetes.io/name: frontend-forge-controller
+  ports:
+    - name: https-webhook
+      port: 443
+      targetPort: 9443
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: frontend-forge-controller-validating-webhook
+webhooks:
+  - name: frontendintegrations.frontend-forge.kubesphere.io
+    admissionReviewVersions:
+      - v1
+    sideEffects: None
+    failurePolicy: Fail
+    clientConfig:
+      service:
+        name: frontend-forge-controller-webhook
+        namespace: extension-frontend-forge
+        path: /validate/frontendintegrations
+        port: 443
+      caBundle: ""
+    rules:
+      - apiGroups:
+          - frontend-forge.kubesphere.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - frontendintegrations
+        scope: Cluster

@@ -5,10 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axum.workspace = true
+axum-server.workspace = true
 chrono.workspace = true
 futures.workspace = true
 frontend-forge-api = { path = "../api" }
 frontend-forge-common = { path = "../common" }
+frontend-forge-manifest = { path = "../manifest" }
 k8s-openapi.workspace = true
 kube.workspace = true
 kube-runtime.workspace = true

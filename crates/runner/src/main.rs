@@ -1,9 +1,7 @@
-mod manifest;
-
 use chrono::Utc;
 use frontend_forge_api::{
     FrontendIntegration, FrontendIntegrationPhase, JSBundle, JsBundleNamespacedKeyRef,
-    JsBundleRawFromSpec, JsBundleSpec, JsBundleStatus, LastBuildError, ManifestRenderError,
+    JsBundleRawFromSpec, JsBundleSpec, JsBundleStatus, LastBuildError,
 };
 use frontend_forge_common::{
     ANNO_BUILD_JOB, ANNO_MANIFEST_CONTENT, ANNO_MANIFEST_HASH, ANNO_SOURCE_GENERATION,
@@ -11,6 +9,7 @@ use frontend_forge_common::{
     LABEL_MANAGED_BY, LABEL_MANIFEST_HASH, LABEL_SPEC_HASH, MANAGED_BY_VALUE, bounded_name,
     hash_label_value, manifest_content_and_hash, serializable_content_and_hash, serializable_hash,
 };
+use frontend_forge_manifest::{ManifestRenderError, render_extension_manifest};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Patch, PatchParams};
@@ -267,7 +266,7 @@ async fn run() -> Result<(), Error> {
             return Ok(());
         }
         let manifest_value =
-            manifest::render_extension_manifest(&fi_for_build).context(RenderManifestSnafu)?;
+            render_extension_manifest(&fi_for_build).context(RenderManifestSnafu)?;
         let (manifest, manifest_hash) =
             manifest_content_and_hash(&manifest_value).context(ManifestHashSnafu)?;
 

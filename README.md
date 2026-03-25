@@ -12,19 +12,21 @@
 
 ## 当前架构
 
-当前实现由三部分组成：
+当前实现由四部分组成：
 
 - `FrontendIntegration`：用户入口 CR，表达菜单、页面和构建引擎版本等意图
-- `frontend-forge-controller`：监听 `FrontendIntegration` 和 `Job`，负责状态流转、Job 创建、失败处理和 `JSBundle` 关联
+- `frontend-forge-manifest`：共享 Manifest 渲染与语义校验逻辑，供 controller webhook 与 runner 复用
+- `frontend-forge-controller`：监听 `FrontendIntegration` 和 `Job`，负责状态流转、Job 创建、失败处理、`JSBundle` 关联，并可选承载 validating webhook
 - `frontend-forge-runner`：作为一次性 Job 运行，读取 `FrontendIntegration`，渲染 Manifest，调用 build-service，并写回产物与状态
 
 资源关系大致如下：
 
 1. 用户提交 `FrontendIntegration`
 2. controller 基于 `spec_hash` 判断是否需要发起构建
-3. controller 创建 runner Job
-4. runner 渲染 Manifest，并调用外部 build-service
-5. runner 更新 `JSBundle`、ConfigMap 以及 `FrontendIntegration.status`
+3. 若启用 admission webhook，API Server 先调用 controller 内 webhook 做前置语义校验
+4. controller 基于 `spec_hash` 判断是否需要发起构建并创建 runner Job
+5. runner 渲染 Manifest，并调用外部 build-service
+6. runner 更新 `JSBundle`、ConfigMap 以及 `FrontendIntegration.status`
 
 ## 现有功能
 
@@ -49,7 +51,7 @@
   - `iframe`
   - `crdTable`
 - 支持 `menus[].key` 与 `pages[].key` 的 1:1 绑定
-- runner 会在构建前执行语义校验，包括：
+- `frontend-forge-manifest` 会在渲染前执行语义校验，包括：
   - 重复菜单 key
   - 重复页面 key
   - 页面配置缺失
@@ -58,6 +60,10 @@
   - 非法页面结构
   - 不支持的 `builder.engineVersion`
 - 当前 Manifest 渲染器基于 `v1` 引擎实现
+- controller 可选提供 validating admission webhook：
+  - `GET /healthz`
+  - `POST /validate/frontendintegrations`
+- webhook 只校验 `CREATE` / `UPDATE`，失败时直接返回原始业务错误
 
 ### 构建与状态管理
 
@@ -80,6 +86,9 @@
   - [`config/manager/controller-deployment.yaml`](config/manager/controller-deployment.yaml)
   - [`config/rbac/controller-rbac.yaml`](config/rbac/controller-rbac.yaml)
   - [`config/rbac/runner-rbac.yaml`](config/rbac/runner-rbac.yaml)
+- 提供可选 webhook 配置 YAML：
+  - [`config/webhook/controller-webhook.yaml`](config/webhook/controller-webhook.yaml)
+  - [`config/rbac/webhook-certgen-rbac.yaml`](config/rbac/webhook-certgen-rbac.yaml)
 - 提供示例 `FrontendIntegration` 清单：
   - [`config/samples/frontend-forge_v1alpha1_frontendintegration.yaml`](config/samples/frontend-forge_v1alpha1_frontendintegration.yaml)
   - [`config/samples/fi-inspecttask.yaml`](config/samples/fi-inspecttask.yaml)
@@ -87,23 +96,33 @@
 
 ## 当前限制
 
-- `FrontendIntegration` 的语义校验仍发生在 runner Job 内，而不是 admission 阶段
 - 当前依赖外部 build-service，仓库本身不包含前端构建服务实现
 - Manifest 渲染引擎目前只有 `v1`
 - 部署方式当前以原生 YAML 为主，未提供 Helm chart 或 Kustomize 方案
+- admission webhook 默认关闭，需要显式部署证书和 webhook 清单后再开启
 
-## TODO
+## Admission Webhook
 
-- 抽出共享的 `frontend-forge-manifest` crate，统一承载 Manifest 渲染与语义校验逻辑
-- 实现 controller 内 validating admission webhook，在 `CREATE` / `UPDATE` 时前置校验 `FrontendIntegration`
-- 使用 `axum` 承载 webhook HTTP 服务
-- 使用 [`kube-webhook-certgen`](https://github.com/jet/kube-webhook-certgen) 管理 webhook 证书和 `caBundle`
-- 在不新增独立 validator Deployment 的前提下，把 webhook 集成进现有 controller Deployment
+webhook 通过现有 controller Deployment 提供，默认配置如下：
 
-说明：
+- `WEBHOOK_ENABLED=false`
+- `WEBHOOK_BIND_ADDR=0.0.0.0:9443`
+- `WEBHOOK_CERT_PATH=/tls/tls.crt`
+- `WEBHOOK_KEY_PATH=/tls/tls.key`
 
-- 以上 TODO 目前仅完成设计，不属于当前实现
-- 详细规划见 [`spec/design.md`](spec/design.md) 的 `vNext: Admission Webhook 前置校验`
+启用顺序：
+
+1. 应用基础清单：
+   - [`config/manager/controller-deployment.yaml`](config/manager/controller-deployment.yaml)
+   - [`config/rbac/controller-rbac.yaml`](config/rbac/controller-rbac.yaml)
+   - [`config/rbac/runner-rbac.yaml`](config/rbac/runner-rbac.yaml)
+2. 应用 certgen 与 webhook 清单：
+   - [`config/rbac/webhook-certgen-rbac.yaml`](config/rbac/webhook-certgen-rbac.yaml)
+   - [`config/webhook/controller-webhook.yaml`](config/webhook/controller-webhook.yaml)
+3. 等待 `frontend-forge-controller-webhook-tls` Secret 和 `ValidatingWebhookConfiguration` 就绪
+4. 把 controller Deployment 中的 `WEBHOOK_ENABLED` 改为 `true`
+
+证书由 `kubespheredev/kube-webhook-certgen:v1.1.1` 生成并回填 `caBundle`。
 
 ## 技术栈
 
@@ -121,8 +140,9 @@
 
 - [`crates/api`](crates/api)：CRD 类型定义、状态结构、CRD 导出
 - [`crates/common`](crates/common)：通用常量、hash 和命名工具
+- [`crates/manifest`](crates/manifest)：共享 Manifest 渲染与语义校验
 - [`crates/controller`](crates/controller)：controller 主逻辑
-- [`crates/runner`](crates/runner)：runner Job 逻辑与 Manifest 渲染
+- [`crates/runner`](crates/runner)：runner Job 逻辑
 - [`xtask`](xtask)：开发辅助命令，如生成 CRD
 - [`config`](config)：部署、RBAC、CRD 和样例清单
 - [`spec`](spec)：设计文档

@@ -4,7 +4,6 @@ use kube::CustomResourceExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use snafu::Snafu;
 use std::collections::BTreeMap;
 
 pub const API_GROUP: &str = "frontend-forge.kubesphere.io";
@@ -183,69 +182,6 @@ pub enum MenuPlacement {
     Global,
     Workspace,
     Cluster,
-}
-
-#[derive(Debug, Snafu)]
-pub enum ManifestRenderError {
-    #[snafu(display(
-        "FrontendIntegration {} has duplicate top-level menu key '{}'",
-        fi_name,
-        key
-    ))]
-    DuplicateTopLevelMenuKey { fi_name: String, key: String },
-    #[snafu(display("FrontendIntegration {} has duplicate page key '{}'", fi_name, key))]
-    DuplicatePageKey { fi_name: String, key: String },
-    #[snafu(display(
-        "FrontendIntegration {} is missing page config for menu key '{}'",
-        fi_name,
-        key
-    ))]
-    MissingPageForMenuKey { fi_name: String, key: String },
-    #[snafu(display(
-        "FrontendIntegration {} has page config '{}' without a menu binding",
-        fi_name,
-        key
-    ))]
-    OrphanPageConfig { fi_name: String, key: String },
-    #[snafu(display(
-        "FrontendIntegration {} has invalid menu shape for key '{}': {}",
-        fi_name,
-        key,
-        message
-    ))]
-    InvalidMenuShape {
-        fi_name: String,
-        key: String,
-        message: String,
-    },
-    #[snafu(display(
-        "FrontendIntegration {} has invalid page shape for key '{}': {}",
-        fi_name,
-        key,
-        message
-    ))]
-    InvalidPageShape {
-        fi_name: String,
-        key: String,
-        message: String,
-    },
-    #[snafu(display("FrontendIntegration {} has invalid menu key '{}'", fi_name, key))]
-    InvalidMenuKey { fi_name: String, key: String },
-    #[snafu(display(
-        "FrontendIntegration {} requires columns for CRD page '{}'",
-        fi_name,
-        key
-    ))]
-    MissingCrdColumns { fi_name: String, key: String },
-    #[snafu(display(
-        "FrontendIntegration {} requested unsupported builder.engineVersion '{}'",
-        fi_name,
-        engine_version
-    ))]
-    UnsupportedEngineVersion {
-        fi_name: String,
-        engine_version: String,
-    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]

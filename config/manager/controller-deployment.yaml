@@ -23,6 +23,10 @@ spec:
         - name: controller
           image: ghcr.io/example/frontend-forge-controller:latest
           imagePullPolicy: IfNotPresent
+          ports:
+            - name: webhook
+              containerPort: 9443
+              protocol: TCP
           env:
             - name: RUNNER_IMAGE
               value: spike2044/frontend-forge-runner:latest
@@ -42,3 +46,20 @@ spec:
               value: "300"
             - name: JOB_TTL_SECONDS_AFTER_FINISHED
               value: "3600"
+            - name: WEBHOOK_ENABLED
+              value: "false"
+            - name: WEBHOOK_BIND_ADDR
+              value: 0.0.0.0:9443
+            - name: WEBHOOK_CERT_PATH
+              value: /tls/tls.crt
+            - name: WEBHOOK_KEY_PATH
+              value: /tls/tls.key
+          volumeMounts:
+            - name: webhook-tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: webhook-tls
+          secret:
+            secretName: frontend-forge-controller-webhook-tls
+            optional: true

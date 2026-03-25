@@ -1,10 +1,12 @@
 use frontend_forge_api::{
     ColumnRenderType, ColumnSpec, CrdScope, CrdTablePageSpec, FrontendIntegration,
-    FrontendIntegrationSpec, ManifestRenderError, MenuNodeType, MenuPlacement, PageSpec, PageType,
+    FrontendIntegrationSpec, MenuNodeType, MenuPlacement, PageSpec, PageType,
 };
 use kube::ResourceExt;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+
+use crate::ManifestRenderError;
 
 const DEFAULT_MENU_ICON: &str = "GridDuotone";
 
