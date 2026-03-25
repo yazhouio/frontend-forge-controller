@@ -13,7 +13,7 @@ use kube::core::{
 };
 use snafu::ResultExt;
 use std::{env, future::pending, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     Error, InvalidWebhookBindAddrSnafu, InvalidWebhookEnabledSnafu, WebhookServerSnafu,
@@ -179,6 +179,7 @@ fn validate_review(review: AdmissionReview<FrontendIntegration>) -> AdmissionRev
 
 fn validate_request_object(request: &AdmissionRequest<FrontendIntegration>) -> AdmissionResponse {
     let Some(fi) = request.object.as_ref() else {
+        warn!(uid = %request.uid, operation = ?request.operation, "admission request missing object");
         return invalid_response(
             request,
             format!(
@@ -189,8 +190,27 @@ fn validate_request_object(request: &AdmissionRequest<FrontendIntegration>) -> A
     };
 
     match validate_frontend_integration(fi) {
-        Ok(()) => AdmissionResponse::from(request),
-        Err(err) => AdmissionResponse::from(request).deny(err.to_string()),
+        Ok(()) => {
+            info!(
+                uid = %request.uid,
+                operation = ?request.operation,
+                name = fi.metadata.name.as_deref().unwrap_or("<unknown>"),
+                allowed = true,
+                "admission request processed"
+            );
+            AdmissionResponse::from(request)
+        }
+        Err(err) => {
+            info!(
+                uid = %request.uid,
+                operation = ?request.operation,
+                name = fi.metadata.name.as_deref().unwrap_or("<unknown>"),
+                allowed = false,
+                reason = %err,
+                "admission request processed"
+            );
+            AdmissionResponse::from(request).deny(err.to_string())
+        }
     }
 }
 

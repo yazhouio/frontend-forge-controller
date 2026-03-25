@@ -124,6 +124,33 @@ webhook 通过现有 controller Deployment 提供，默认配置如下：
 
 证书由 `kubespheredev/kube-webhook-certgen:v1.1.1` 生成并回填 `caBundle`。
 
+## Dev Webhook Debugging
+
+如果你要把远端集群的 admission webhook 临时转到本地开发机，可以使用：
+
+```bash
+ssh -N -L 44321:127.0.0.1:44321 root@<remote-host>
+REMOTE_SSH_TARGET=root@<remote-host> ./scripts/dev-webhook.sh start
+```
+
+脚本会：
+
+- 拉取远端最小 kubeconfig 并改写到本地 `https://127.0.0.1:44321`
+- 启动本地 `frontend-forge-controller` webhook
+- 启动 `cloudflared` quick tunnel
+- 把远端 `ValidatingWebhookConfiguration` 临时切到 `clientConfig.url`
+
+常用命令：
+
+```bash
+REMOTE_SSH_TARGET=root@<remote-host> ./scripts/dev-webhook.sh status
+REMOTE_SSH_TARGET=root@<remote-host> ./scripts/dev-webhook.sh logs controller
+REMOTE_SSH_TARGET=root@<remote-host> ./scripts/dev-webhook.sh logs cloudflared
+REMOTE_SSH_TARGET=root@<remote-host> ./scripts/dev-webhook.sh stop
+```
+
+`stop` 会恢复远端 webhook 配置。
+
 ## 技术栈
 
 - Rust 2024 edition
