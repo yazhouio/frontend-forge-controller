@@ -8,6 +8,7 @@ license.workspace = true
 chrono.workspace = true
 frontend-forge-api = { path = "../api" }
 frontend-forge-common = { path = "../common" }
+frontend-forge-manifest = { path = "../manifest" }
 k8s-openapi.workspace = true
 kube.workspace = true
 reqwest.workspace = true

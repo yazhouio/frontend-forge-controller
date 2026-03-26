@@ -1,0 +1,104 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frontend-forge-webhook-certgen
+  namespace: extension-frontend-forge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: frontend-forge-webhook-certgen
+  namespace: extension-frontend-forge
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: frontend-forge-webhook-certgen
+  namespace: extension-frontend-forge
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: frontend-forge-webhook-certgen
+subjects:
+  - kind: ServiceAccount
+    name: frontend-forge-webhook-certgen
+    namespace: extension-frontend-forge
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: frontend-forge-webhook-certgen
+rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingwebhookconfigurations"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: frontend-forge-webhook-certgen
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: frontend-forge-webhook-certgen
+subjects:
+  - kind: ServiceAccount
+    name: frontend-forge-webhook-certgen
+    namespace: extension-frontend-forge
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: frontend-forge-webhook-certgen-create
+  namespace: extension-frontend-forge
+spec:
+  template:
+    spec:
+      serviceAccountName: frontend-forge-webhook-certgen
+      restartPolicy: OnFailure
+      containers:
+        - name: create
+          image: kubespheredev/kube-webhook-certgen:v1.1.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - create
+            - --host=frontend-forge-controller-webhook,frontend-forge-controller-webhook.$(POD_NAMESPACE).svc
+            - --namespace=$(POD_NAMESPACE)
+            - --secret-name=frontend-forge-controller-webhook-tls
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: frontend-forge-webhook-certgen-patch
+  namespace: extension-frontend-forge
+spec:
+  template:
+    spec:
+      serviceAccountName: frontend-forge-webhook-certgen
+      restartPolicy: OnFailure
+      containers:
+        - name: patch
+          image: kubespheredev/kube-webhook-certgen:v1.1.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - patch
+            - --namespace=$(POD_NAMESPACE)
+            - --secret-name=frontend-forge-controller-webhook-tls
+            - --webhook-name=frontend-forge-controller-validating-webhook
+            - --patch-validating=true
+            - --patch-mutating=false
+            - --patch-failure-policy=Fail
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace

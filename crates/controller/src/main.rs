@@ -1,3 +1,5 @@
+mod webhook;
+
 use chrono::Utc;
 use frontend_forge_api::{
     FrontendIntegration, FrontendIntegrationPhase, FrontendIntegrationStatus, JSBundle,
@@ -21,6 +23,8 @@ use serde_json::json;
 use snafu::{ResultExt, Snafu};
 use std::collections::BTreeMap;
 use std::env;
+use std::net::{AddrParseError, SocketAddr};
+use std::str::ParseBoolError;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -93,6 +97,29 @@ enum Error {
         namespace: String,
         name: String,
         source: kube::Error,
+    },
+    #[snafu(display("invalid WEBHOOK_ENABLED value '{value}': {source}"))]
+    InvalidWebhookEnabled {
+        value: String,
+        source: ParseBoolError,
+    },
+    #[snafu(display("invalid WEBHOOK_BIND_ADDR '{value}': {source}"))]
+    InvalidWebhookBindAddr {
+        value: String,
+        source: AddrParseError,
+    },
+    #[snafu(display(
+        "failed to load webhook TLS assets cert={cert_path} key={key_path}: {source}"
+    ))]
+    WebhookTlsConfig {
+        cert_path: String,
+        key_path: String,
+        source: std::io::Error,
+    },
+    #[snafu(display("webhook server failed on {bind_addr}: {source}"))]
+    WebhookServer {
+        bind_addr: SocketAddr,
+        source: std::io::Error,
     },
 }
 
@@ -172,8 +199,18 @@ fn build_spec_hash(fi: &FrontendIntegration) -> Result<String, CommonError> {
     serializable_hash(&fi.spec.without_enabled())
 }
 
+fn install_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("ring crypto provider should install before controller startup");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    install_rustls_crypto_provider();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -186,7 +223,26 @@ async fn main() -> Result<(), Error> {
         client: client.clone(),
         config: ControllerConfig::from_env(),
     });
+    let webhook_config = webhook::WebhookConfig::from_env()?;
 
+    if webhook_config.enabled {
+        info!(bind_addr = %webhook_config.bind_addr, "admission webhook enabled");
+        tokio::try_join!(
+            run_controller(ctx),
+            webhook::run_webhook_server(webhook_config)
+        )?;
+    } else {
+        info!("admission webhook disabled");
+        run_controller(ctx).await?;
+    }
+
+    info!("controller shutdown complete");
+
+    Ok(())
+}
+
+async fn run_controller(ctx: Arc<ContextData>) -> Result<(), Error> {
+    let client = ctx.client.clone();
     let fi_api = Api::<FrontendIntegration>::all(client.clone());
     let job_api = Api::<Job>::namespaced(client.clone(), &ctx.config.work_namespace);
     Controller::new(fi_api, watcher::Config::default())
@@ -200,8 +256,6 @@ async fn main() -> Result<(), Error> {
             }
         })
         .await;
-
-    info!("controller shutdown complete");
 
     Ok(())
 }
